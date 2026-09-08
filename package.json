@@ -1,0 +1,32 @@
+{
+  "name": "kudiclap-backend",
+  "version": "1.0.0",
+  "description": "Backend API for KudiClap — a zero-fee tipping platform for African creators. Handles creator profiles, payments via Payaza, USSD simulation, transactions, and withdrawals.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js"
+  },
+  "keywords": [
+    "kudiclap",
+    "tipping",
+    "payaza",
+    "firebase",
+    "nigeria"
+  ],
+  "author": "Ulodo Emmanuel",
+  "license": "ISC",
+  "dependencies": {
+    "axios": "^1.20.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "express-rate-limit": "^8.7.0",
+    "firebase-admin": "^12.2.0",
+    "joi": "^17.13.1",
+    "morgan": "^1.10.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.3"
+  }
+}

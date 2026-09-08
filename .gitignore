@@ -1,0 +1,26 @@
+# ─────────────────────────────────────────────────────────────────
+# KudiClap Backend — .gitignore
+# Files and folders that should NEVER be committed to GitHub
+# ─────────────────────────────────────────────────────────────────
+
+# ── Environment variables ─────────────────────────────────────────
+# Contains API keys and secrets — NEVER commit this
+.env
+
+# ── Firebase service account key ─────────────────────────────────
+# Downloaded from Firebase console — contains private key credentials
+config/firebase-key.json
+
+# ── Node.js dependencies ──────────────────────────────────────────
+# Installed via "npm install" — no need to track in git
+node_modules/
+
+# ── OS / Editor files ─────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# ── Logs ──────────────────────────────────────────────────────────
+*.log
+npm-debug.log*
