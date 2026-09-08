@@ -1,24 +1,23 @@
 /**
  * routes/creatorRoutes.js
  *
- * Defines all HTTP routes related to creator profiles.
+ * Creator profile routes for KudiClap.
  *
  * Base path: /api/creators  (registered in app.js)
  *
- * NOTE: Signup and login routes are in /api/auth (authRoutes.js).
- *       This file handles profile reads and updates only.
- *
- * Routes:
- *   GET /api/creators/u/:username       → Public tip page (by username)
- *   GET /api/creators/dashboard/:id     → Private dashboard (auth required)
- *   GET /api/creators/:id               → Public profile (by Firestore ID)
- *   PUT /api/creators/:id               → Update profile (auth required)
- *
- * Route ordering matters in Express — more specific paths MUST come before
- * wildcard params. The order here is deliberate:
- *   /u/:username must come before /:id
+ * Route ordering matters — specific paths before wildcard params:
+ *   /u/:username  must come before /:id
  *   /dashboard/:id must come before /:id
- * Otherwise Express would treat "u" or "dashboard" as the :id value.
+ *   /:id/bank must come before /:id
+ *
+ * Public routes:
+ *   GET /api/creators/u/:username       → Fan tip page (by username)
+ *   GET /api/creators/:id               → Public profile (by Firestore ID)
+ *
+ * Protected routes:
+ *   GET /api/creators/dashboard/:id     → Private dashboard + recent transactions
+ *   PUT /api/creators/:id               → Update name, bio, profilePicture
+ *   PUT /api/creators/:id/bank          → Save/update bank account for withdrawals
  */
 
 const express = require('express');
@@ -29,34 +28,22 @@ const {
   getCreatorProfile,
   getCreatorDashboard,
   updateCreatorProfile,
+  updateBankAccount,
 } = require('../controllers/creatorController');
 
 const { protect, isSameUser } = require('../middlewares/authMiddleware');
 
-// ── Public routes ─────────────────────────────────────────────────────────────
-
-// GET /api/creators/u/:username
-// The fan-facing tip page — e.g. GET /api/creators/u/ulodo
-// Returns: name, bio, profilePicture, ussdCode, totalEarnings
+// ── Public ────────────────────────────────────────────────────────────────────
 router.get('/u/:username', getCreatorByUsername);
 
-// ── Private routes ────────────────────────────────────────────────────────────
-
-// GET /api/creators/dashboard/:id
-// Full private dashboard: wallet, phone, recent transactions
-// Requires: valid idToken + token UID must match :id
+// ── Protected — specific paths before wildcard ────────────────────────────────
 router.get('/dashboard/:id', protect, isSameUser, getCreatorDashboard);
 
-// ── Public routes (after specific private routes) ────────────────────────────
-
-// GET /api/creators/:id
-// Public profile by Firestore doc ID — must come AFTER /dashboard/:id and /u/:username
+// ── Public (after specific protected routes) ─────────────────────────────────
 router.get('/:id', getCreatorProfile);
 
-// ── Private routes (update) ───────────────────────────────────────────────────
-
-// PUT /api/creators/:id
-// Update name, bio, or profilePicture — creator can only edit their own profile
+// ── Protected — updates ───────────────────────────────────────────────────────
+router.put('/:id/bank', protect, isSameUser, updateBankAccount);
 router.put('/:id', protect, isSameUser, updateCreatorProfile);
 
 module.exports = router;

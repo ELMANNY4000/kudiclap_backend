@@ -3,56 +3,39 @@
  *
  * Production-grade creator payout processing — powered by Payaza Transfers.
  *
- * ── Payaza Transfer flow for Nigeria (NGN) ────────────────────────────────────
+ * ── Withdrawal flow ────────────────────────────────────────────────────────────
  *
- *   Step 1 — Verify the recipient account name
- *     GET /api/v1/transfers/account-name-query
- *     Returns the account name so we can confirm the number is correct.
+ *   1. Creator submits: { creatorId, amount, pin }
+ *   2. Validate input + verify PIN (bcrypt compare against stored hash)
+ *   3. Calculate commission (from Firestore commissions collection)
+ *   4. Check walletBalance >= amount + commission
+ *   5. Atomically deduct wallet + create withdrawal doc (status: pending)
+ *   6. Fetch Payaza account reference
+ *   7. Call Payaza Transfer API (nuban for Nigerian bank accounts)
+ *   8. On Payaza failure: reverse deduction, mark withdrawal failed
+ *   9. Final status via transfer.success / transfer.failed webhook
  *
- *   Step 2 — Get our Payaza account reference
- *     GET /payaza-account/api/v1/account/details
- *     Returns payazaAccountReference (required in every transfer request).
+ * ── PIN requirement ───────────────────────────────────────────────────────────
+ *   Every withdrawal requires the creator's 4-digit PIN (set via /api/auth/set-pin).
+ *   This is separate from their login password — it is an application-level
+ *   authorization check stored as a bcrypt hash in Firestore.
  *
- *   Step 3 — Initiate the transfer
- *     POST /api/v1/transfers/initiate-transfer
- *     transaction_type: "nuban" for Nigerian bank accounts
- *     The wallet phone number maps to a bank account via the creator's bank details.
+ * ── Commission deduction ─────────────────────────────────────────────────────
+ *   Commission is fetched from the commissions Firestore collection.
+ *   The commission amount is deducted from the wallet in addition to the
+ *   withdrawal amount. If no commission is configured, none is deducted.
  *
- *   Step 4 — Track via webhook or query
- *     Payaza fires transfer.success / transfer.failed webhook events.
- *     handleWebhook() in paymentController.js listens and updates withdrawal status.
- *
- * ── Important Payaza requirements for live transfers ──────────────────────────
- *   - Your Payaza account must be funded before initiating any transfer
- *   - A transaction PIN must be set up in the dashboard
- *   - Your server IP must be whitelisted in Settings → Developers
- *   - Generate a unique transaction_reference per transfer attempt
- *
- * ── Design: deduct-first, refund-on-failure ───────────────────────────────────
- *   We deduct walletBalance BEFORE calling Payaza. This prevents race conditions
- *   where two simultaneous withdrawal requests could both pass the balance check.
- *   If Payaza rejects the transfer, we immediately restore the balance.
- *
- * ── Nigerian bank account requirement ────────────────────────────────────────
- *   Payaza NGN transfers use the "nuban" transaction_type, which requires a
- *   standard Nigerian bank account number and bank code — NOT a mobile number.
- *   We therefore ask creators for their bank account details (account_number +
- *   bank_code) rather than just a mobile money number.
- *
- *   Common Nigerian bank codes for Payaza:
- *     Access Bank:   044    GTBank:   058    First Bank: 011
- *     Zenith Bank:   057    UBA:      033    FCMB:       214
- *     OPay:          999992 Kuda:     090267 PalmPay:    999991
- *
- * Exported functions (used by withdrawalRoutes.js):
+ * Exported functions:
  *   - requestWithdrawal      → POST /api/withdrawals
  *   - getCreatorWithdrawals  → GET  /api/withdrawals/:creatorId
  *   - getWithdrawalStatus    → GET  /api/withdrawals/status/:withdrawalId
  */
 
+const bcrypt = require('bcrypt');
 const payaza = require('../config/payaza');
 const { db } = require('../config/firebase');
 const { validateWithdrawal } = require('../utils/validation');
+const { calculateCommission } = require('../services/commissionService');
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Internal helper — fetch our Payaza account reference
@@ -113,7 +96,7 @@ const requestWithdrawal = async (req, res, next) => {
       return res.status(400).json({ success: false, error: error.details[0].message });
     }
 
-    const { creatorId, amount } = value;
+    const { creatorId, amount, pin } = value;
 
     // ── Ownership check ───────────────────────────────────────────────────────
     if (req.user.uid !== creatorId) {
@@ -133,21 +116,36 @@ const requestWithdrawal = async (req, res, next) => {
 
     const creatorData = creatorDoc.data();
 
-    // ── Check bank account details are set ───────────────────────────────────
-    // Payaza requires a bank account number + bank code for NGN transfers.
-    // Creators must have saved these on their profile before withdrawing.
-    if (!creatorData.bankAccountNumber || !creatorData.bankCode) {
+    // ── Verify PIN ────────────────────────────────────────────────────────────
+    // PIN is required for every withdrawal — it is separate from the login password
+    if (!creatorData.pin) {
       return res.status(400).json({
         success: false,
-        error: 'No bank account on file. Please add your bank account details in your profile before withdrawing.',
+        error: 'No withdrawal PIN set. Please set your PIN at /api/auth/set-pin first.',
       });
     }
 
-    // ── Pre-check balance ─────────────────────────────────────────────────────
-    if (amount > creatorData.walletBalance) {
+    const pinValid = await bcrypt.compare(pin.toString(), creatorData.pin);
+    if (!pinValid) {
+      return res.status(400).json({ success: false, error: 'Invalid PIN.' });
+    }
+
+    // ── Check bank account details are set ───────────────────────────────────
+    if (!creatorData.bankAccountNumber || !creatorData.bankCode) {
       return res.status(400).json({
         success: false,
-        error: `Insufficient balance. Available: ₦${creatorData.walletBalance.toLocaleString()}`,
+        error: 'No bank account on file. Please add your bank account at PUT /api/creators/:id/bank.',
+      });
+    }
+
+    // ── Calculate commission ──────────────────────────────────────────────────
+    const { commission, totalDeduction, breakdown } = await calculateCommission(amount, 'withdraw');
+
+    // ── Pre-check balance (including commission) ──────────────────────────────
+    if (creatorData.walletBalance < totalDeduction) {
+      return res.status(400).json({
+        success: false,
+        error: `Insufficient balance. Available: ₦${creatorData.walletBalance.toLocaleString()}. Required (inc. fees): ₦${totalDeduction.toLocaleString()}`,
       });
     }
 
@@ -187,6 +185,9 @@ const requestWithdrawal = async (req, res, next) => {
           id: withdrawalId,
           creatorId,
           amount,
+          commission,
+          totalDeduction,
+          commissionBreakdown: breakdown,
           bankAccountNumber: creatorData.bankAccountNumber,
           bankCode: creatorData.bankCode,
           bankName: creatorData.bankName || '',
@@ -214,7 +215,7 @@ const requestWithdrawal = async (req, res, next) => {
       await db.runTransaction(async (firestoreTx) => {
         const freshDoc = await firestoreTx.get(creatorRef);
         firestoreTx.update(creatorRef, {
-          walletBalance: freshDoc.data().walletBalance + amount,
+          walletBalance: freshDoc.data().walletBalance + totalDeduction, // restore amount + commission
           updatedAt: new Date(),
         });
         firestoreTx.update(withdrawalRef, {
@@ -270,7 +271,7 @@ const requestWithdrawal = async (req, res, next) => {
       await db.runTransaction(async (firestoreTx) => {
         const freshDoc = await firestoreTx.get(creatorRef);
         firestoreTx.update(creatorRef, {
-          walletBalance: freshDoc.data().walletBalance + amount,
+          walletBalance: freshDoc.data().walletBalance + totalDeduction,
           updatedAt: new Date(),
         });
         firestoreTx.update(withdrawalRef, {
@@ -303,6 +304,9 @@ const requestWithdrawal = async (req, res, next) => {
       data: {
         withdrawalId,
         payazaReference,
+        amount,
+        commission,
+        totalDeducted: totalDeduction,
         newBalance: newWalletBalance,
         status: 'pending',
       },

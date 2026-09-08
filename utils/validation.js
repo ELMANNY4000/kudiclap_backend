@@ -262,9 +262,9 @@ const validateUssdPayment = (data) => {
  * Required:
  *   - creatorId → the ID of the creator requesting the withdrawal
  *   - amount    → amount to withdraw in Naira (minimum ₦500)
+ *   - pin       → creator's 4-digit withdrawal PIN
  *
- * The destination mobile money number is pulled from the creator's profile
- * in Firestore — we don't ask for it again here to reduce friction.
+ * Commission is calculated server-side — not sent by the client.
  *
  * @param {object} data - req.body from the withdrawal request
  */
@@ -274,10 +274,199 @@ const validateWithdrawal = (data) => {
       'string.empty': 'Creator ID is required',
     }),
 
-    // Minimum withdrawal is ₦500 to avoid tiny payouts that cost more to process
     amount: Joi.number().min(500).required().messages({
       'number.min': 'Minimum withdrawal amount is ₦500',
       'any.required': 'Amount is required',
+    }),
+
+    // 4-digit withdrawal PIN — verified via bcrypt against the stored hash
+    pin: Joi.string().pattern(/^\d{4}$/).required().messages({
+      'string.pattern.base': 'PIN must be exactly 4 digits',
+      'string.empty': 'PIN is required',
+    }),
+  });
+
+  return schema.validate(data);
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Auth schemas — PIN, password, OTP
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Validates POST /api/auth/change-password
+ */
+const validateChangePassword = (data) => {
+  const schema = Joi.object({
+    oldPassword: Joi.string().required().messages({
+      'string.empty': 'Current password is required',
+    }),
+    newPassword: Joi.string()
+      .min(8)
+      .pattern(/^(?=.*[A-Za-z])(?=.*\d).+$/)
+      .required()
+      .messages({
+        'string.min': 'New password must be at least 8 characters',
+        'string.pattern.base': 'New password must contain at least one letter and one number',
+        'string.empty': 'New password is required',
+      }),
+  });
+
+  return schema.validate(data);
+};
+
+/**
+ * Validates POST /api/auth/set-pin
+ */
+const validateSetPin = (data) => {
+  const schema = Joi.object({
+    pin: Joi.string().pattern(/^\d{4}$/).required().messages({
+      'string.pattern.base': 'PIN must be exactly 4 digits (numbers only)',
+      'string.empty': 'PIN is required',
+    }),
+  });
+
+  return schema.validate(data);
+};
+
+/**
+ * Validates POST /api/auth/change-pin
+ */
+const validateChangePin = (data) => {
+  const schema = Joi.object({
+    currentPin: Joi.string().pattern(/^\d{4}$/).required().messages({
+      'string.pattern.base': 'Current PIN must be exactly 4 digits',
+      'string.empty': 'Current PIN is required',
+    }),
+    newPin: Joi.string().pattern(/^\d{4}$/).required().messages({
+      'string.pattern.base': 'New PIN must be exactly 4 digits',
+      'string.empty': 'New PIN is required',
+    }),
+  });
+
+  return schema.validate(data);
+};
+
+/**
+ * Validates POST /api/auth/request-otp
+ */
+const validateRequestOtp = (data) => {
+  const schema = Joi.object({
+    email: Joi.string().email().required().messages({
+      'string.email': 'Please provide a valid email address',
+      'string.empty': 'Email is required',
+    }),
+    purpose: Joi.string()
+      .valid('forgot_password', 'reset_pin', 'withdrawal_verification')
+      .required()
+      .messages({
+        'any.only': 'Purpose must be one of: forgot_password, reset_pin, withdrawal_verification',
+        'string.empty': 'Purpose is required',
+      }),
+  });
+
+  return schema.validate(data);
+};
+
+/**
+ * Validates POST /api/auth/verify-otp
+ */
+const validateVerifyOtp = (data) => {
+  const schema = Joi.object({
+    email: Joi.string().email().required(),
+    otpCode: Joi.string().length(6).pattern(/^\d{6}$/).required().messages({
+      'string.length': 'OTP must be exactly 6 digits',
+      'string.pattern.base': 'OTP must be 6 digits',
+    }),
+    purpose: Joi.string()
+      .valid('forgot_password', 'reset_pin', 'withdrawal_verification')
+      .required(),
+  });
+
+  return schema.validate(data);
+};
+
+/**
+ * Validates POST /api/auth/reset-pin
+ */
+const validateResetPin = (data) => {
+  const schema = Joi.object({
+    verificationToken: Joi.string().required().messages({
+      'string.empty': 'Verification token is required',
+    }),
+    newPin: Joi.string().pattern(/^\d{4}$/).required().messages({
+      'string.pattern.base': 'New PIN must be exactly 4 digits',
+      'string.empty': 'New PIN is required',
+    }),
+  });
+
+  return schema.validate(data);
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Bank account schema
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Validates PUT /api/creators/:id/bank
+ */
+const validateBankAccount = (data) => {
+  const schema = Joi.object({
+    bankAccountNumber: Joi.string()
+      .pattern(/^\d{10}$/)
+      .required()
+      .messages({
+        'string.pattern.base': 'Bank account number must be exactly 10 digits (NUBAN standard)',
+        'string.empty': 'Bank account number is required',
+      }),
+
+    bankCode: Joi.string().required().messages({
+      'string.empty': 'Bank code is required (e.g. "044" for Access Bank)',
+    }),
+
+    bankName: Joi.string().max(100).allow('').optional(),
+
+    bankAccountName: Joi.string().min(2).max(100).required().messages({
+      'string.empty': 'Account name is required (as it appears on your bank account)',
+    }),
+  });
+
+  return schema.validate(data);
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// USSD withdrawal schemas
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Validates POST /api/ussd/withdraw/initiate
+ */
+const validateUssdWithdrawal = (data) => {
+  const schema = Joi.object({
+    amount: Joi.number().min(500).required().messages({
+      'number.min': 'Minimum USSD withdrawal amount is ₦500',
+      'any.required': 'Amount is required',
+    }),
+    pin: Joi.string().pattern(/^\d{4}$/).required().messages({
+      'string.pattern.base': 'PIN must be exactly 4 digits',
+      'string.empty': 'PIN is required',
+    }),
+  });
+
+  return schema.validate(data);
+};
+
+/**
+ * Validates POST /api/ussd/withdraw/verify
+ */
+const validateUssdVerify = (data) => {
+  const schema = Joi.object({
+    reference: Joi.string().required().messages({
+      'string.empty': 'Transaction reference is required',
+    }),
+    confirmationCode: Joi.string().length(6).pattern(/^\d{6}$/).required().messages({
+      'string.length': 'Confirmation code must be 6 digits',
+      'string.pattern.base': 'Confirmation code must be 6 digits',
     }),
   });
 
@@ -288,7 +477,16 @@ module.exports = {
   validateCreatorSignup,
   validateLogin,
   validateCreatorUpdate,
+  validateBankAccount,
   validateTip,
   validateUssdPayment,
   validateWithdrawal,
+  validateChangePassword,
+  validateSetPin,
+  validateChangePin,
+  validateRequestOtp,
+  validateVerifyOtp,
+  validateResetPin,
+  validateUssdWithdrawal,
+  validateUssdVerify,
 };

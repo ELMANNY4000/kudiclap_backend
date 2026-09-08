@@ -1,33 +1,41 @@
 /**
  * routes/ussdRoutes.js
  *
- * Defines the route for USSD payment simulation.
+ * USSD routes for KudiClap.
  *
- * Base path: /api/ussd  (set in app.js)
+ * Base path: /api/ussd  (registered in app.js)
  *
- * Routes:
- *   POST /api/ussd  → Simulate a USSD payment from a fan to a creator
+ * Fan-facing (public):
+ *   POST /api/ussd/tip                   → Fan tips a creator via USSD shortcode
  *
- * How this is used:
- *   In a real USSD setup, the telco's gateway (Twilio, MFS Africa) would POST
- *   to this endpoint automatically when a fan dials a USSD code on their phone.
+ * Creator-facing (protected — PIN required in request body):
+ *   POST /api/ussd/withdraw/initiate     → Initiate a USSD withdrawal (PIN-verified)
+ *   POST /api/ussd/withdraw/verify       → Confirm with the USSD confirmation code
+ *   POST /api/ussd/withdraw/cancel       → Cancel a pending USSD withdrawal
  *
- *   For the hackathon, the frontend simulates this with a form where the fan
- *   enters the creator's USSD code, their phone number, and the tip amount —
- *   then the frontend POSTs directly to this endpoint.
- *
- * Accepts: { ussdCode, amount, fanPhoneNumber }
- * Example: { "ussdCode": "*388*47291#", "amount": 500, "fanPhoneNumber": "08012345678" }
+ * The legacy POST / route is kept for backward compatibility with any existing
+ * clients that hit /api/ussd directly (maps to fan tipping).
  */
 
 const express = require('express');
 const router = express.Router();
 
-// Controller function for USSD payment simulation
-const { processUssdPayment } = require('../controllers/ussdController');
+const {
+  processUssdTip,
+  initiateUssdWithdrawal,
+  verifyUssdWithdrawal,
+  cancelUssdWithdrawal,
+} = require('../controllers/ussdController');
 
-// POST /api/ussd
-// Publicly accessible — simulates the USSD gateway calling our backend
-router.post('/', processUssdPayment);
+const { protect } = require('../middlewares/authMiddleware');
+
+// Fan tipping via USSD shortcode — public
+router.post('/tip', processUssdTip);
+router.post('/', processUssdTip); // Legacy compatibility (old frontend may use POST /api/ussd)
+
+// Creator USSD withdrawal — all require authentication
+router.post('/withdraw/initiate', protect, initiateUssdWithdrawal);
+router.post('/withdraw/verify', protect, verifyUssdWithdrawal);
+router.post('/withdraw/cancel', protect, cancelUssdWithdrawal);
 
 module.exports = router;

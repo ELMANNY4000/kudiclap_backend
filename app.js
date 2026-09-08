@@ -129,10 +129,12 @@ const paymentLimiter = rateLimit({
 
 // Apply general limiter to all routes as a baseline
 app.use(generalLimiter);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Health Check Route
 //
-// A simple GET /health endpoint that returns 200 OK with a status message.
-// Used by Railway/Heroku to confirm the server is running and healthy.
-// Also useful for quickly checking the deployment is live after a deploy.
+// GET /health — returns 200 OK with a status message.
+// Used by Railway to confirm the server is running after deploy.
 // ─────────────────────────────────────────────────────────────────────────────
 app.get('/health', (req, res) => {
   res.status(200).json({

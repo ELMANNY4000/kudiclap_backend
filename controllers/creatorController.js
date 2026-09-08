@@ -1,44 +1,45 @@
 /**
  * controllers/creatorController.js
  *
- * Handles all business logic related to KudiClap creator profiles.
+ * Handles all creator profile operations.
  *
- * NOTE: Creator signup and login are handled in authController.js.
- * This controller is purely for profile reads and updates — all the
- * "who is this creator" data, not the "prove who you are" data.
+ * Auth/signup/login/PIN/password are in authController.js.
+ * This controller is purely for profile reads and updates.
  *
- * Exported functions (used by creatorRoutes.js):
+ * Firestore creator document fields:
+ *   id, name, email, username, mobileMoneyNumber, ussdCode,
+ *   bio, profilePicture, totalEarnings, walletBalance, pin (bcrypt),
+ *   bankAccountNumber, bankCode, bankName, bankAccountName,
+ *   createdAt, updatedAt, tokensRevokedAt
+ *
+ * Exported functions:
  *   - getCreatorByUsername  → GET /api/creators/u/:username   (public — fan tip page)
- *   - getCreatorProfile     → GET /api/creators/:id           (public — by Firestore ID)
+ *   - getCreatorProfile     → GET /api/creators/:id           (public)
  *   - getCreatorDashboard   → GET /api/creators/dashboard/:id (private)
  *   - updateCreatorProfile  → PUT /api/creators/:id           (private)
+ *   - updateBankAccount     → PUT /api/creators/:id/bank      (private)
  */
 
 const { db, admin } = require('../config/firebase');
-const { validateCreatorUpdate } = require('../utils/validation');
+const { validateCreatorUpdate, validateBankAccount } = require('../utils/validation');
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /api/creators/u/:username
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Returns a creator's public profile by their username.
+ * Returns a creator's public profile by username.
  *
- * This is the primary public endpoint — it powers the fan-facing tip page at
- * kudiclap.com/ulodo (where "ulodo" is the username). Fans don't know or care
- * about Firestore document IDs; they just follow the creator's link.
- *
- * Returns only public-safe fields — no wallet balance, no phone number.
+ * This is the fan-facing tip page — kudiclap.com/ulodo.
+ * Only public-safe fields are returned (no wallet, no phone, no PIN).
  *
  * @route  GET /api/creators/u/:username
- * @access Public — this is the page fans visit to tip a creator
+ * @access Public
  */
 const getCreatorByUsername = async (req, res, next) => {
   try {
-    // Usernames are stored lowercase — normalize the param for consistent matching
     const username = req.params.username.toLowerCase();
 
-    // Query Firestore for a creator whose username field matches
     const snapshot = await db
       .collection('creators')
       .where('username', '==', username)
@@ -54,7 +55,6 @@ const getCreatorByUsername = async (req, res, next) => {
 
     const creatorData = snapshot.docs[0].data();
 
-    // Return only public-safe fields
     return res.status(200).json({
       success: true,
       data: {
@@ -64,8 +64,7 @@ const getCreatorByUsername = async (req, res, next) => {
         bio: creatorData.bio,
         profilePicture: creatorData.profilePicture,
         ussdCode: creatorData.ussdCode,
-        // Show total earnings publicly — it builds social proof and trust for the creator
-        totalEarnings: creatorData.totalEarnings,
+        totalEarnings: creatorData.totalEarnings, // Social proof — visible publicly
       },
     });
 
@@ -79,11 +78,7 @@ const getCreatorByUsername = async (req, res, next) => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Returns a creator's public profile by their Firestore document ID.
- *
- * Used internally (e.g. when the frontend has the ID from a previous API call)
- * and as a fallback for direct ID lookups. For fan-facing pages, prefer the
- * username endpoint above.
+ * Returns a creator's public profile by Firestore document ID.
  *
  * @route  GET /api/creators/:id
  * @access Public
@@ -93,14 +88,12 @@ const getCreatorProfile = async (req, res, next) => {
     const { id } = req.params;
 
     const creatorDoc = await db.collection('creators').doc(id).get();
-
     if (!creatorDoc.exists) {
       return res.status(404).json({ success: false, error: 'Creator not found.' });
     }
 
     const creatorData = creatorDoc.data();
 
-    // Return public-safe fields only
     return res.status(200).json({
       success: true,
       data: {
@@ -124,30 +117,24 @@ const getCreatorProfile = async (req, res, next) => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Returns the creator's private dashboard data.
+ * Returns the creator's private dashboard — full profile + recent transactions.
  *
- * Includes the full profile (wallet balance, mobile money number) plus
- * the 10 most recent transactions. Only the creator themselves can access this.
- *
- * The protect + isSameUser middleware chain in the route definition ensures
- * that req.user.uid === req.params.id before this function ever runs.
+ * Includes wallet balance, phone number, bank account details, and PIN status.
+ * Only the creator themselves can access this (protect + isSameUser in routes).
  *
  * @route  GET /api/creators/dashboard/:id
- * @access Private — protect + isSameUser in route
+ * @access Private
  */
 const getCreatorDashboard = async (req, res, next) => {
   try {
     const { id } = req.params;
 
-    // Fetch full creator profile from Firestore (including sensitive fields)
     const creatorDoc = await db.collection('creators').doc(id).get();
-
     if (!creatorDoc.exists) {
       return res.status(404).json({ success: false, error: 'Creator not found.' });
     }
 
-    // Fetch the 10 most recent tips received by this creator
-    // Ordered by timestamp descending — newest tips appear first on the dashboard
+    // Fetch 10 most recent transactions
     const txSnapshot = await db
       .collection('transactions')
       .where('creatorId', '==', id)
@@ -156,7 +143,6 @@ const getCreatorDashboard = async (req, res, next) => {
       .get();
 
     const recentTransactions = txSnapshot.docs.map((doc) => doc.data());
-
     const creatorData = creatorDoc.data();
 
     return res.status(200).json({
@@ -169,9 +155,15 @@ const getCreatorDashboard = async (req, res, next) => {
         bio: creatorData.bio,
         profilePicture: creatorData.profilePicture,
         ussdCode: creatorData.ussdCode,
-        mobileMoneyNumber: creatorData.mobileMoneyNumber, // Shown on private dashboard
+        mobileMoneyNumber: creatorData.mobileMoneyNumber,
         totalEarnings: creatorData.totalEarnings,
         walletBalance: creatorData.walletBalance,
+        hasPin: !!creatorData.pin, // Never expose the hash itself
+        // Bank account (needed for withdrawal setup)
+        bankAccountNumber: creatorData.bankAccountNumber || null,
+        bankCode: creatorData.bankCode || null,
+        bankName: creatorData.bankName || null,
+        bankAccountName: creatorData.bankAccountName || null,
         createdAt: creatorData.createdAt,
         recentTransactions,
       },
@@ -187,23 +179,22 @@ const getCreatorDashboard = async (req, res, next) => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Updates a creator's editable profile fields.
+ * Updates a creator's profile fields (name, bio, profilePicture).
  *
- * Creators can update: name, bio, profilePicture.
- * Fields that cannot be changed here: email, username, mobileMoneyNumber, ussdCode.
- *   - email/password changes go through Firebase Auth directly
- *   - username changes are blocked (would break existing tip links)
- *   - mobileMoneyNumber changes need a dedicated verified-update flow (future)
- *   - ussdCode is permanent once assigned
+ * Fields that are NOT updatable here:
+ *   - email / password → via Firebase Auth directly or /api/auth/change-password
+ *   - username → permanent (would break existing tip links)
+ *   - ussdCode → permanent once assigned
+ *   - mobileMoneyNumber → requires a separate verified-update flow (future)
+ *   - bankAccount → use PUT /api/creators/:id/bank instead
  *
  * @route  PUT /api/creators/:id
- * @access Private — protect + isSameUser in route
+ * @access Private
  */
 const updateCreatorProfile = async (req, res, next) => {
   try {
     const { id } = req.params;
 
-    // Validate only the fields allowed to be updated
     const { error, value } = validateCreatorUpdate(req.body);
     if (error) {
       return res.status(400).json({ success: false, error: error.details[0].message });
@@ -216,25 +207,71 @@ const updateCreatorProfile = async (req, res, next) => {
       return res.status(404).json({ success: false, error: 'Creator not found.' });
     }
 
-    // Build the update payload — only include fields that were actually sent
-    // Spreading undefined values into Firestore update() would cause an error
+    // Build update payload — only include fields that were sent
     const updates = { updatedAt: new Date() };
-
     if (value.name !== undefined) updates.name = value.name;
     if (value.bio !== undefined) updates.bio = value.bio;
     if (value.profilePicture !== undefined) updates.profilePicture = value.profilePicture;
 
-    // If name is being updated, also update it in Firebase Auth for consistency
-    // (Firebase Auth displayName is used in some email templates)
+    // Sync name change to Firebase Auth displayName
     if (value.name) {
       await admin.auth().updateUser(id, { displayName: value.name });
     }
 
     await creatorRef.update(updates);
 
+    return res.status(200).json({ success: true, message: 'Profile updated successfully.' });
+
+  } catch (err) {
+    next(err);
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PUT /api/creators/:id/bank
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Saves or updates a creator's bank account details.
+ *
+ * This is required before a creator can request a withdrawal.
+ * Payaza NGN transfers use the NUBAN bank account standard — creators must
+ * provide their account number and bank code.
+ *
+ * Common Nigerian bank codes:
+ *   Access Bank: 044  |  GTBank: 058  |  First Bank: 011  |  Zenith: 057
+ *   UBA: 033          |  OPay: 999992 |  Kuda: 090267     |  PalmPay: 999991
+ *
+ * @route  PUT /api/creators/:id/bank
+ * @access Private
+ */
+const updateBankAccount = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+
+    const { error, value } = validateBankAccount(req.body);
+    if (error) {
+      return res.status(400).json({ success: false, error: error.details[0].message });
+    }
+
+    const creatorRef = db.collection('creators').doc(id);
+    const creatorDoc = await creatorRef.get();
+
+    if (!creatorDoc.exists) {
+      return res.status(404).json({ success: false, error: 'Creator not found.' });
+    }
+
+    await creatorRef.update({
+      bankAccountNumber: value.bankAccountNumber,
+      bankCode: value.bankCode,
+      bankName: value.bankName || '',
+      bankAccountName: value.bankAccountName,
+      updatedAt: new Date(),
+    });
+
     return res.status(200).json({
       success: true,
-      message: 'Profile updated successfully.',
+      message: 'Bank account saved successfully. You can now request withdrawals.',
     });
 
   } catch (err) {
@@ -247,4 +284,5 @@ module.exports = {
   getCreatorProfile,
   getCreatorDashboard,
   updateCreatorProfile,
+  updateBankAccount,
 };
