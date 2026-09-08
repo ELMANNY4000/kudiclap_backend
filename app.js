@@ -13,7 +13,7 @@
  *
  * Request lifecycle for every API call:
  *   Client → CORS check → JSON parser → Morgan logger → Route handler
- *   → Controller → Firebase/Flutterwave → Response
+ *   → Controller → Firebase/Payaza → Response
  *   (on error: → errorMiddleware → JSON error response)
  */
 
@@ -59,11 +59,30 @@ app.use(cors({
 }));
 
 /**
+ * Webhook raw body — MUST be registered BEFORE express.json()
+ *
+ * Payaza verifies webhook signatures using HMAC-SHA512 over the RAW request
+ * body buffer. Once express.json() parses the body, the raw bytes are gone
+ * and signature verification will always fail.
+ *
+ * By registering express.raw() on the webhook route first, that specific
+ * route receives req.body as a Buffer. handleWebhook() in paymentController
+ * calls JSON.parse(req.body.toString('utf-8')) manually after verifying.
+ *
+ * All other routes continue to receive parsed JSON from express.json() below.
+ */
+app.use(
+  '/api/payments/webhook',
+  express.raw({ type: 'application/json' })
+);
+
+/**
  * JSON body parser
  *
  * Parses incoming request bodies with Content-Type: application/json
  * and makes the parsed data available as req.body in controllers.
  * Without this, req.body would always be undefined.
+ * Note: does NOT apply to /api/payments/webhook (handled above).
  */
 app.use(express.json());
 
@@ -150,10 +169,10 @@ app.get('/health', (req, res) => {
 // Each router handles a group of related endpoints.
 // The base path here + the path in each router file = the full endpoint URL.
 //
-// /api/auth         → signup, login, logout, me
-// /api/creators     → profile reads (by ID or username), dashboard, update
-// /api/payments     → tip processing, Flutterwave webhook
-// /api/ussd         → USSD payment simulation
+// /api/auth         → signup, login, logout, me, PIN management, OTP
+// /api/creators     → profile reads (by ID or username), dashboard, bank account
+// /api/payments     → tip processing, Payaza webhook, card callback
+// /api/ussd         → USSD tip + USSD withdrawal flow
 // /api/withdrawals  → cash-out requests + history
 // /api/transactions → tip history
 // ─────────────────────────────────────────────────────────────────────────────

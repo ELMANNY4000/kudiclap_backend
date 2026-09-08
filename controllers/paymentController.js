@@ -1,54 +1,60 @@
 /**
  * controllers/paymentController.js
  *
- * Production-grade payment collection for KudiClap tips — powered by Payaza.
+ * Payment collection for KudiClap tips — powered by the Payaza Node.js SDK.
  *
  * ── Payment flows ─────────────────────────────────────────────────────────────
  *
- *   Web Checkout (recommended for fans — card + bank transfer + mobile money):
- *     The frontend loads the Payaza Checkout SDK which renders a hosted modal.
- *     The backend's role is to:
- *       1. Generate a unique transaction_reference before checkout starts
- *       2. Receive the Payaza webhook after the fan completes payment
- *       3. Verify the transaction server-side before crediting the creator
+ *   Web Checkout (recommended — card + bank transfer + mobile money):
+ *     The Payaza Checkout JS SDK renders a hosted modal on the frontend.
+ *     Our backend role:
+ *       1. Generate a unique transaction_reference
+ *       2. Store a pendingPayments record in Firestore
+ *       3. Return checkout params the frontend passes to PayazaCheckout.setup()
+ *       4. Receive and verify the Payaza webhook after fan completes payment
+ *       5. Credit the creator's wallet on confirmed payment
  *
- *   Card Charge API (direct — when frontend sends card details):
- *     POST /api/payments/tip with paymentMethod: 'card'
- *     → Payaza responds with do3dsAuth: true  → return threeDsHtml to frontend
- *     → Payaza responds with do3dsAuth: false → payment complete or failed
- *     → Final result arrives at callback_url OR via window.postMessage
+ *   Direct Card Charge (card details sent server-side):
+ *     POST /api/payments/tip with paymentMethod:'card'
+ *     Uses payaza.cards.charge() from the SDK.
+ *     Possible responses:
+ *       do3dsAuth: true  → return threeDsHtml to frontend for 3DS challenge
+ *       statusOk + paymentCompleted → immediate success, credit creator
+ *       failure → return error to frontend
  *
- *   USSD (via KudiClap shortcode):
- *     POST /api/ussd — handled separately in ussdController.js
- *     The fan dials *388*XXXXX# → we look up the creator → we initiate
- *     a Payaza checkout session on their behalf.
+ *   USSD Tip (fan dials *388*XXXXX#):
+ *     Handled by ussdController.js — returns checkout params for web fallback.
  *
- * ── Payaza API endpoints used here ────────────────────────────────────────────
+ * ── SDK methods used ──────────────────────────────────────────────────────────
  *
- *   Card charge:    POST /merchant/api/v1/card/charge
- *   Verify txn:     GET  /merchant/api/v1/transaction/query?transaction_reference=xxx
- *   Webhook:        POST /api/payments/webhook  (Payaza calls this URL)
+ *   payaza.cards.charge(payload)
+ *     → Charges a card directly. Returns do3dsAuth / statusOk / paymentCompleted.
+ *
+ *   payaza.account.getTransactionStatus(txRef)
+ *     → Server-side verification of any transaction by our reference.
+ *     → Called before crediting to prevent fraud.
+ *
+ *   verifyWebhookSignature(rawBody, signature, secret)
+ *     → HMAC-SHA512 verification of incoming webhook requests.
+ *     → rawBody must be a Buffer — app.js uses express.raw() on this route.
  *
  * ── Credit logic ──────────────────────────────────────────────────────────────
  *
- *   We only credit the creator AFTER server-side verification confirms the
- *   payment succeeded. We never trust the frontend's claim or the raw webhook
- *   payload alone.
+ *   creditCreatorWallet() is idempotent — it checks for an existing Firestore
+ *   transaction document keyed by payazaRef before writing. Duplicate webhook
+ *   deliveries never double-credit a creator.
  *
- *   creditCreatorWallet() is idempotent — it checks for an existing
- *   transaction document keyed by payazaRef before writing, so duplicate
- *   webhook deliveries never double-credit a creator.
- *
- * Exported functions (used by paymentRoutes.js):
- *   - processTip        → POST /api/payments/tip
- *   - verifyPayment     → POST /api/payments/verify/:txRef
- *   - handleWebhook     → POST /api/payments/webhook
+ * Exported:
+ *   - processTip          → POST /api/payments/tip
+ *   - verifyPayment       → POST /api/payments/verify/:txRef
+ *   - handleCardCallback  → POST /api/payments/card-callback
+ *   - handleWebhook       → POST /api/payments/webhook
  */
 
-const payaza = require('../config/payaza');
+const { payaza, verifyWebhookSignature } = require('../config/payaza');
+const { PayazaError } = require('payaza-node-sdk');
 const { db } = require('../config/firebase');
 const { validateTip } = require('../utils/validation');
-const crypto = require('crypto');
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Internal helper — credit creator wallet + log transaction (idempotent)
@@ -58,20 +64,17 @@ const crypto = require('crypto');
  * Credits a creator's wallet and writes a transaction record to Firestore.
  *
  * This is the ONLY place in the app where a creator's balance increases.
- * It is called by verifyPayment() and handleWebhook() — never for unverified
- * or pending charges.
+ * Called by verifyPayment() and handleWebhook() — never for unverified charges.
  *
- * Idempotency:
- *   Before writing, we query transactions for an existing doc with the same
- *   payazaRef. If found we skip and return false. This means it is safe to call
- *   this function multiple times for the same payment — only one write occurs.
+ * Idempotency: checks for an existing transaction with the same payazaRef
+ * before writing. Safe to call multiple times for the same payment.
  *
- * @param {string} creatorId   - Firestore creator document ID
- * @param {number} amount      - Amount in Naira (₦) to credit
- * @param {string} paymentMethod - 'card' | 'bankTransfer' | 'ussd'
- * @param {string} payazaRef   - Payaza transaction_reference (idempotency key)
- * @param {object} fanDetails  - { fanName, fanEmail } — may be empty strings
- * @returns {Promise<boolean>} - true if credited now, false if already existed
+ * @param {string} creatorId     - Firestore creator document ID
+ * @param {number} amount        - Naira (₦) amount to credit
+ * @param {string} paymentMethod - 'card' | 'checkout' | 'bankTransfer' | 'ussd'
+ * @param {string} payazaRef     - Our transaction_reference (idempotency key)
+ * @param {object} fanDetails    - { fanName, fanEmail }
+ * @returns {Promise<boolean>}   - true if credited now, false if already existed
  */
 const creditCreatorWallet = async (
   creatorId,
@@ -95,10 +98,8 @@ const creditCreatorWallet = async (
   const creatorRef = db.collection('creators').doc(creatorId);
 
   // ── Atomic Firestore transaction ──────────────────────────────────────────
-  // Wallet update + transaction log succeed together or both roll back.
+  // Wallet update + transaction log both succeed or both roll back.
   await db.runTransaction(async (firestoreTx) => {
-    // Read inside the transaction to get the freshest balance and avoid
-    // race conditions when two fans tip the same creator simultaneously.
     const freshDoc = await firestoreTx.get(creatorRef);
 
     if (!freshDoc.exists) {
@@ -107,29 +108,28 @@ const creditCreatorWallet = async (
 
     const data = freshDoc.data();
 
-    // Update both earnings fields
     firestoreTx.update(creatorRef, {
       totalEarnings: data.totalEarnings + amount, // Lifetime total — never decreases
       walletBalance: data.walletBalance + amount,  // Available to withdraw
       updatedAt: new Date(),
     });
 
-    // Log the transaction for dashboard / history display
-    const txRef = db.collection('transactions').doc();
-    firestoreTx.set(txRef, {
-      id: txRef.id,
+    // Log the transaction for dashboard / history
+    const txDocRef = db.collection('transactions').doc();
+    firestoreTx.set(txDocRef, {
+      id: txDocRef.id,
       creatorId,
       fanName: fanDetails.fanName || 'Anonymous',
       fanEmail: fanDetails.fanEmail || '',
       amount,
       paymentMethod,
       status: 'completed',
-      payazaRef: String(payazaRef), // Payaza transaction_reference — idempotency key
+      payazaRef: String(payazaRef), // Idempotency key
       timestamp: new Date(),
     });
   });
 
-  console.log(`[Credit] ₦${amount} credited to creator ${creatorId} (payazaRef: ${payazaRef})`);
+  console.log(`[Credit] ₦${amount} credited to creator ${creatorId} (ref: ${payazaRef})`);
   return true;
 };
 
@@ -138,39 +138,23 @@ const creditCreatorWallet = async (
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Initiates a tip payment from a fan to a creator.
+ * Initiates a tip from a fan to a creator.
  *
- * Two modes depending on paymentMethod:
+ * paymentMethod: 'checkout' | 'mobileMoney' | 'bankTransfer'
+ *   → Returns Payaza Web Checkout SDK params. The frontend opens the modal,
+ *     Payaza handles the UI, webhook fires on completion.
  *
- *   'checkout' (default / recommended):
- *     Returns the transaction_reference the frontend needs to initialise
- *     the Payaza Web Checkout SDK. The SDK handles the actual card / bank
- *     transfer / mobile money UI. Payaza fires a webhook when done.
- *
- *     Frontend flow:
- *       1. Call POST /api/payments/tip → get { transactionReference }
- *       2. Pass transactionReference to PayazaCheckout.setup({ ... })
- *       3. Fan completes payment in the modal
- *       4. Payaza fires webhook → backend credits creator
- *       5. Frontend polls GET /api/payments/verify/:txRef for confirmation
- *
- *   'card' (direct charge — card details sent to backend):
- *     The backend charges the card directly via Payaza Card Charge API.
- *     Returns either:
- *       { status: '3ds',     threeDsHtml }  → frontend must render this HTML
- *       { status: 'success', transactionReference } → payment complete
- *       { status: 'failed',  error }
- *
- *     ⚠️ PCI note: sending raw card numbers to your backend requires
- *     PCI DSS compliance. For most use cases, the 'checkout' flow is safer
- *     and recommended — Payaza's hosted modal handles card data.
+ * paymentMethod: 'card'
+ *   → Charges the card directly via payaza.cards.charge().
+ *   → May return { status:'3ds', threeDsHtml } for 3D Secure cards.
+ *   → Successful immediate charges credit the creator on the spot.
  *
  * @route  POST /api/payments/tip
- * @access Public — fans do not need an account to tip
+ * @access Public — no account needed to tip
  */
 const processTip = async (req, res, next) => {
   try {
-    // ── Validate request body ─────────────────────────────────────────────────
+    // ── Validate ──────────────────────────────────────────────────────────────
     const { error, value } = validateTip(req.body);
     if (error) {
       return res.status(400).json({ success: false, error: error.details[0].message });
@@ -183,12 +167,11 @@ const processTip = async (req, res, next) => {
       fanName,
       fanEmail,
       fanPhoneNumber,
-      // Card-specific (only for paymentMethod: 'card')
       cardNumber,
       cardCvv,
       cardExpiryMonth,
       cardExpiryYear,
-      cardPin,          // Required for NGN card charges by Payaza
+      cardPin,
     } = value;
 
     // ── Verify creator exists ─────────────────────────────────────────────────
@@ -198,13 +181,13 @@ const processTip = async (req, res, next) => {
     }
 
     // ── Generate unique transaction reference ─────────────────────────────────
-    // Payaza requires a unique reference per transaction (max 15 chars recommended).
-    // We encode the creatorId prefix + timestamp to stay traceable.
-    // Format: kc-{first8charsOfCreatorId}-{last6digitsOfTimestamp}
+    // SDK docs say >= 10 chars and globally unique per Payaza account.
+    // Format: kc-{8 chars of creatorId}-{6 digit timestamp suffix}
     const txRef = `kc-${creatorId.substring(0, 8)}-${Date.now().toString().slice(-6)}`;
 
-    // Store the pending transaction reference in Firestore so we can match it
-    // when the webhook arrives, even if the server restarts in between.
+    // ── Store pending payment in Firestore ────────────────────────────────────
+    // handleWebhook() and verifyPayment() look this up to know which creator
+    // to credit and how much — even if the server restarts between now and then.
     await db.collection('pendingPayments').doc(txRef).set({
       txRef,
       creatorId,
@@ -213,30 +196,29 @@ const processTip = async (req, res, next) => {
       fanName: fanName || 'Anonymous',
       fanEmail: fanEmail || '',
       createdAt: new Date(),
-      // Expires in 30 minutes — Payaza's default virtual account window
-      expiresAt: new Date(Date.now() + 30 * 60 * 1000),
+      expiresAt: new Date(Date.now() + 30 * 60 * 1000), // 30-min expiry
     });
 
-    // ── Route by payment method ───────────────────────────────────────────────
+    // ── Route to the correct payment flow ────────────────────────────────────
     switch (paymentMethod) {
 
-      // ── Web Checkout (card + bank transfer + mobile money via hosted modal) ──
-      // The backend just supplies the transaction reference.
-      // The frontend uses Payaza's JS SDK to open the payment modal.
-      // Payaza handles all card / bank / MoMo UI on their hosted page.
+      // ── Web Checkout ─────────────────────────────────────────────────────
+      // The backend just returns the checkout params.
+      // The frontend calls PayazaCheckout.setup(checkoutParams) to open the modal.
+      // Payaza handles card / bank transfer / mobile money on their hosted page.
+      // Final confirmation arrives via webhook → handleWebhook().
       case 'checkout':
       case 'mobileMoney':
       case 'bankTransfer': {
-        // Return the reference and all the params the frontend SDK needs
         return res.status(200).json({
           success: true,
           status: 'checkout',
-          message: 'Transaction reference generated. Initialise the Payaza Checkout SDK with these details.',
+          message: 'Transaction reference generated. Initialise the Payaza Checkout SDK with the checkoutParams.',
           data: {
             transactionReference: txRef,
             amount,
             currency: 'NGN',
-            // Frontend passes these directly into PayazaCheckout.setup()
+            // The frontend passes these directly into PayazaCheckout.setup()
             checkoutParams: {
               merchant_key: process.env.PAYAZA_PUBLIC_KEY,
               connection_mode: process.env.PAYAZA_ENV === 'live' ? 'Live' : 'Test',
@@ -247,19 +229,15 @@ const processTip = async (req, res, next) => {
               last_name: (fanName || 'Anonymous').split(' ').slice(1).join(' ') || 'Fan',
               phone_number: fanPhoneNumber || '08000000000',
               transaction_reference: txRef,
-              // Additional metadata attached to this transaction — useful for reconciliation
-              additional_details: {
-                creatorId,
-                source: 'kudiclap-tip',
-              },
+              additional_details: { creatorId, source: 'kudiclap-tip' },
             },
           },
         });
       }
 
       // ── Direct Card Charge ────────────────────────────────────────────────
-      // Fan sends card details → we charge via Payaza Card Charge API.
-      // For NGN cards, card PIN is required by Payaza.
+      // Uses the SDK's payaza.cards.charge() method.
+      // Card PIN is required for NGN-denominated cards (Payaza requirement).
       case 'card': {
         if (!cardNumber || !cardCvv || !cardExpiryMonth || !cardExpiryYear) {
           return res.status(400).json({
@@ -268,8 +246,6 @@ const processTip = async (req, res, next) => {
           });
         }
 
-        // Build the Payaza Card Charge payload
-        // Docs: https://docs.payaza.africa/guides/card-collection
         const cardPayload = {
           transaction_reference: txRef,
           amount,
@@ -282,30 +258,33 @@ const processTip = async (req, res, next) => {
             cvv: cardCvv,
             expiry_month: cardExpiryMonth,
             expiry_year: cardExpiryYear,
-            // card_pin is required for NGN card charges in Nigeria (Payaza requirement)
+            // Payaza requires card PIN for Nigerian NGN card charges
             ...(cardPin && { card_pin: cardPin }),
           },
-          // Payaza POSTs the final payment result to this URL after 3DS completes.
-          // Your server receives this and can immediately verify + credit.
+          // Payaza POSTs the final result here after 3DS completes
           callback_url: `${process.env.BACKEND_URL}/api/payments/card-callback`,
         };
 
         let chargeResponse;
         try {
-          chargeResponse = await payaza.post('/merchant/api/v1/card/charge', cardPayload);
+          // payaza.cards.charge() returns the parsed response body
+          // Throws PayazaError on non-2xx responses
+          chargeResponse = await payaza.cards.charge(cardPayload);
         } catch (chargeError) {
-          console.error('[Card Charge] Payaza API error:', chargeError.response?.data || chargeError.message);
+          // PayazaError has .message, .status (HTTP code), .response (parsed body)
+          const isPayazaError = chargeError instanceof PayazaError;
+          console.error('[Card Charge] Error:', isPayazaError ? chargeError.response : chargeError.message);
           return res.status(502).json({
             success: false,
             error: 'Payment gateway error. Please try again.',
-            details: chargeError.response?.data?.message || chargeError.message,
+            details: isPayazaError ? chargeError.message : 'Unexpected error',
           });
         }
 
-        // ── 3DS Authentication required ───────────────────────────────────
-        // When do3dsAuth is true, the payment is NOT yet complete.
-        // The frontend must inject threeDsHtml into the DOM to show the
-        // bank's OTP / biometric challenge. Final result comes via callback_url.
+        // ── 3DS required ──────────────────────────────────────────────────
+        // Payment is NOT yet complete — frontend must render threeDsHtml.
+        // The card issuer shows an OTP / biometric challenge inside an iframe.
+        // Final result arrives via callback_url (handleCardCallback).
         if (chargeResponse.do3dsAuth === true) {
           return res.status(200).json({
             success: true,
@@ -318,15 +297,10 @@ const processTip = async (req, res, next) => {
           });
         }
 
-        // ── Payment completed without 3DS ─────────────────────────────────
+        // ── Immediate success (no 3DS) ────────────────────────────────────
         if (chargeResponse.statusOk === true && chargeResponse.paymentCompleted === true) {
-          // Verify server-side before crediting — never trust the charge response alone
           const credited = await creditCreatorWallet(
-            creatorId,
-            amount,
-            'card',
-            txRef,
-            { fanName, fanEmail }
+            creatorId, amount, 'card', txRef, { fanName, fanEmail }
           );
 
           return res.status(200).json({
@@ -348,21 +322,16 @@ const processTip = async (req, res, next) => {
         });
       }
 
-      // ── USSD (KudiClap shortcode — handled by ussdController) ────────────
-      // This case should not be reached here — ussdController.js calls
-      // processTip with paymentMethod:'ussd' internally. We handle it
-      // gracefully just in case.
-      case 'ussd': {
+      case 'ussd':
         return res.status(400).json({
           success: false,
-          error: 'USSD payments are initiated via POST /api/ussd, not /api/payments/tip.',
+          error: 'USSD tips are initiated via POST /api/ussd/tip, not /api/payments/tip.',
         });
-      }
 
       default:
         return res.status(400).json({
           success: false,
-          error: `Unknown payment method: "${paymentMethod}". Use checkout, card, mobileMoney, or bankTransfer.`,
+          error: `Unknown payment method "${paymentMethod}". Use: checkout, card, mobileMoney, bankTransfer.`,
         });
     }
 
@@ -376,18 +345,14 @@ const processTip = async (req, res, next) => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Verifies a Payaza transaction by its reference and credits the creator.
+ * Verifies a Payaza transaction server-side and credits the creator.
  *
- * When to call this:
- *   1. After the Payaza Checkout SDK callback fires (frontend confirms payment)
- *   2. After a card 3DS redirect completes (Payaza POSTs to callback_url)
- *   3. As a manual fallback if the webhook was missed / delayed
+ * Call this:
+ *   1. After the Payaza Checkout SDK fires its callback (frontend confirms)
+ *   2. As a manual fallback if the webhook was missed or delayed
  *
- * Always verify server-side — never credit based solely on the frontend's
- * report or the raw webhook payload.
- *
- * Payaza verify endpoint:
- *   GET /merchant/api/v1/transaction/query?transaction_reference=<txRef>
+ * Uses payaza.account.getTransactionStatus(txRef) — the SDK method that
+ * queries Payaza for the authoritative status of our transaction reference.
  *
  * @route  POST /api/payments/verify/:txRef
  * @access Public
@@ -400,11 +365,8 @@ const verifyPayment = async (req, res, next) => {
       return res.status(400).json({ success: false, error: 'Transaction reference is required.' });
     }
 
-    // ── Look up the pending payment record in Firestore ───────────────────────
-    // This gives us the creatorId, amount, and fan details we stored when
-    // the tip was initiated — we need them to credit the right creator.
+    // Load the pending payment record — it holds creatorId, amount, fan details
     const pendingDoc = await db.collection('pendingPayments').doc(txRef).get();
-
     if (!pendingDoc.exists) {
       return res.status(404).json({
         success: false,
@@ -414,22 +376,21 @@ const verifyPayment = async (req, res, next) => {
 
     const pending = pendingDoc.data();
 
-    // ── Query Payaza for the authoritative transaction status ─────────────────
-    // We pass the transaction_reference we generated and check what Payaza says.
+    // ── Query Payaza for authoritative status ─────────────────────────────────
+    // payaza.account.getTransactionStatus(ref) — SDK method, returns parsed body
     let verifyResponse;
     try {
-      verifyResponse = await payaza.get(
-        `/merchant/api/v1/transaction/query?transaction_reference=${txRef}`
-      );
+      verifyResponse = await payaza.account.getTransactionStatus(txRef);
     } catch (verifyError) {
-      console.error('[Verify] Payaza query error:', verifyError.response?.data || verifyError.message);
+      const isPayazaError = verifyError instanceof PayazaError;
+      console.error('[Verify] Payaza query error:', isPayazaError ? verifyError.response : verifyError.message);
       return res.status(502).json({
         success: false,
         error: 'Could not verify payment status with Payaza. Please try again.',
       });
     }
 
-    // Payaza returns statusOk: true + paymentCompleted: true for a successful payment
+    // Payaza returns statusOk + paymentCompleted for a successful transaction
     const paymentSucceeded =
       verifyResponse.statusOk === true && verifyResponse.paymentCompleted === true;
 
@@ -441,16 +402,14 @@ const verifyPayment = async (req, res, next) => {
       });
     }
 
-    // ── Cross-check amount ────────────────────────────────────────────────────
-    // Payaza returns the actual amount charged — compare it against what we
-    // stored to guard against amount tampering on the frontend.
+    // ── Amount cross-check ────────────────────────────────────────────────────
+    // Guard against amount tampering on the frontend
     const amountPaid = verifyResponse.amountPaid || verifyResponse.amount_paid;
     if (amountPaid && Math.abs(amountPaid - pending.amount) > 1) {
-      // Log for investigation — allow small rounding differences (< ₦1) through
       console.warn(`[Verify] Amount mismatch for ${txRef}: expected ₦${pending.amount}, got ₦${amountPaid}`);
     }
 
-    // ── Credit the creator (idempotent) ───────────────────────────────────────
+    // ── Credit creator (idempotent) ───────────────────────────────────────────
     const credited = await creditCreatorWallet(
       pending.creatorId,
       pending.amount,
@@ -459,7 +418,7 @@ const verifyPayment = async (req, res, next) => {
       { fanName: pending.fanName, fanEmail: pending.fanEmail }
     );
 
-    // Clean up the pending payment record — no longer needed
+    // Clean up — no longer needed
     await db.collection('pendingPayments').doc(txRef).delete();
 
     return res.status(200).json({
@@ -486,29 +445,24 @@ const verifyPayment = async (req, res, next) => {
 /**
  * Receives the card payment result POSTed by Payaza to our callback_url.
  *
- * Payaza sends this after a card charge completes (success or failure) — either
- * immediately for non-3DS cards, or after the fan completes 3DS authentication.
- *
- * The payload contains statusOk and paymentCompleted — we verify, credit, and
- * redirect the fan to the appropriate frontend page.
+ * Payaza POSTs here after a card charge completes (success or failure),
+ * including after the fan finishes a 3DS challenge.
+ * We credit the creator and redirect the fan to the appropriate frontend page.
  *
  * @route  POST /api/payments/card-callback
- * @access Public — called by Payaza's servers
+ * @access Public — called by Payaza servers
  */
 const handleCardCallback = async (req, res, next) => {
   try {
     const { statusOk, paymentCompleted, transaction_reference, debugMessage } = req.body;
 
-    // Log every callback for debugging
     console.log(`[Card Callback] txRef=${transaction_reference}, statusOk=${statusOk}, paymentCompleted=${paymentCompleted}`);
 
     if (statusOk === true && paymentCompleted === true) {
-      // Look up the pending payment to get creatorId and amount
       const pendingDoc = await db.collection('pendingPayments').doc(transaction_reference).get();
 
       if (pendingDoc.exists) {
         const pending = pendingDoc.data();
-
         await creditCreatorWallet(
           pending.creatorId,
           pending.amount,
@@ -516,16 +470,13 @@ const handleCardCallback = async (req, res, next) => {
           transaction_reference,
           { fanName: pending.fanName, fanEmail: pending.fanEmail }
         );
-
         await db.collection('pendingPayments').doc(transaction_reference).delete();
       }
 
-      // Redirect fan to success page on the frontend
       return res.redirect(`${process.env.FRONTEND_URL}/tip/success?ref=${transaction_reference}`);
     }
 
-    // Payment failed — redirect to failure page
-    console.warn(`[Card Callback] Payment failed for ${transaction_reference}: ${debugMessage}`);
+    console.warn(`[Card Callback] Failed for ${transaction_reference}: ${debugMessage}`);
     return res.redirect(
       `${process.env.FRONTEND_URL}/tip/failed?ref=${transaction_reference}&reason=${encodeURIComponent(debugMessage || 'Payment failed')}`
     );
@@ -540,96 +491,118 @@ const handleCardCallback = async (req, res, next) => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Handles Payaza webhook notifications.
+ * Handles all Payaza webhook notifications.
  *
- * Payaza fires webhooks for:
- *   - Completed card transactions (successful or failed)
- *   - Completed bank transfer / virtual account collections
- *   - Transfer (payout) completions
+ * ── Signature verification ────────────────────────────────────────────────────
  *
- * ── Webhook security ───────────────────────────────────────────────────────
- * Payaza signs each webhook with a SHA-256 HMAC using your webhook secret.
+ * Payaza signs webhooks with HMAC-SHA512 over the RAW request body buffer.
  * The signature is in the "x-payaza-signature" header.
- * We verify it before processing any payload.
  *
- * ── Setup in Payaza dashboard ──────────────────────────────────────────────
- *   Settings → Developers → Webhooks → Add webhook URL:
- *   https://your-backend.railway.app/api/payments/webhook
- *   Then copy the generated secret to PAYAZA_WEBHOOK_SECRET in .env
+ * CRITICAL: req.body here must be a raw Buffer — NOT parsed JSON.
+ * app.js registers express.raw({ type: 'application/json' }) on this route
+ * BEFORE the global express.json() middleware, so this route receives the
+ * raw bytes. We then JSON.parse() manually after signature verification.
  *
- * We always return 200 immediately — Payaza retries if we return non-2xx.
+ * We use verifyWebhookSignature() from the SDK — it handles the SHA512 HMAC
+ * internally. The old manual SHA256 implementation has been removed.
+ *
+ * ── Events handled ────────────────────────────────────────────────────────────
+ *
+ *   Collection success (card / bank transfer / mobile money tip received):
+ *     → verify with payaza.account.getTransactionStatus()
+ *     → credit creator wallet via creditCreatorWallet()
+ *
+ *   Transfer completion (creator payout sent or failed):
+ *     → update withdrawal document status
+ *     → if failed: auto-refund creator wallet (restore totalDeduction)
+ *
+ * Always returns 200 — Payaza retries on non-2xx responses.
+ *
+ * ── Dashboard setup ───────────────────────────────────────────────────────────
+ *   Settings → Developers → Webhooks → URL:
+ *     https://your-backend.railway.app/api/payments/webhook
+ *   Copy the generated secret → PAYAZA_WEBHOOK_SECRET in .env
  *
  * @route  POST /api/payments/webhook
- * @access Public — called by Payaza servers (verified by HMAC signature)
+ * @access Public — Payaza servers only (verified by HMAC-SHA512 signature)
  */
 const handleWebhook = async (req, res) => {
   try {
-    // ── Verify webhook signature ──────────────────────────────────────────────
-    const payazaSignature = req.headers['x-payaza-signature'];
+    // ── Signature verification ────────────────────────────────────────────────
+    // req.body is a raw Buffer here (app.js uses express.raw() on this route)
+    const signature = req.headers['x-payaza-signature'] || '';
     const webhookSecret = process.env.PAYAZA_WEBHOOK_SECRET;
 
-    if (webhookSecret && payazaSignature) {
-      // Compute HMAC-SHA256 of the raw request body using our webhook secret
-      // req.body is already parsed JSON — re-stringify for consistent hashing
-      const computedSig = crypto
-        .createHmac('sha256', webhookSecret)
-        .update(JSON.stringify(req.body))
-        .digest('hex');
+    if (webhookSecret) {
+      // verifyWebhookSignature(rawBodyBuffer, signatureHeader, secret)
+      // Returns true/false — uses HMAC-SHA512 internally
+      const isValid = verifyWebhookSignature(req.body, signature, webhookSecret);
 
-      if (computedSig !== payazaSignature) {
+      if (!isValid) {
         console.warn('[Webhook] Invalid signature — request rejected.');
-        // Return 200 anyway — we don't want Payaza to keep retrying a rejected request
+        // Return 200 so Payaza doesn't keep retrying a signature failure
         return res.status(200).json({ received: false, error: 'Invalid signature.' });
       }
-    } else if (!webhookSecret) {
-      // Webhook secret not configured — log a warning but continue processing
-      // (acceptable in test mode; must be set before going live)
-      console.warn('[Webhook] PAYAZA_WEBHOOK_SECRET not set — skipping signature verification.');
+    } else {
+      // Secret not configured — warn loudly, continue in dev/test mode
+      // This MUST be set before going live
+      console.warn('[Webhook] PAYAZA_WEBHOOK_SECRET not set — skipping signature check.');
     }
 
-    const payload = req.body;
-    const event = payload.event || payload.notification_type;
+    // ── Parse the raw body ────────────────────────────────────────────────────
+    // req.body is a Buffer because we use express.raw() on this route.
+    // We parse it to JSON here after signature has been verified.
+    let payload;
+    try {
+      payload = JSON.parse(req.body.toString('utf-8'));
+    } catch (parseErr) {
+      console.error('[Webhook] Failed to parse body as JSON:', parseErr.message);
+      return res.status(200).json({ received: true, error: 'Invalid JSON body.' });
+    }
+
+    // Payaza webhooks use different field names depending on the event type —
+    // we normalise them here so the rest of the handler is clean
+    const event = payload.event || payload.notification_type || payload.event_type;
     const data = payload.data || payload;
+    const txRef = data?.transaction_reference || data?.reference;
 
-    console.log(`[Webhook] Event: ${event}, txRef: ${data?.transaction_reference || data?.reference}`);
+    console.log(`[Webhook] Event: "${event}", txRef: "${txRef}"`);
 
-    // ── Successful collection (card / bank transfer / mobile money) ────────────
-    if (
-      (event === 'charge.success' || event === 'collection.success' || payload.statusOk === true) &&
-      (data?.paymentCompleted === true || data?.status === 'successful' || data?.status === 'success')
-    ) {
-      const txRef = data.transaction_reference || data.reference;
+    // ── Collection success (tip received) ─────────────────────────────────────
+    // Fired when a fan successfully completes a card, bank transfer, or
+    // mobile money payment via the Payaza Checkout modal.
+    const isCollectionSuccess =
+      event === 'charge.success' ||
+      event === 'collection.success' ||
+      event === 'COLLECTION_SUCCESS' ||
+      (data?.status === 'successful') ||
+      (data?.status === 'success');
 
-      if (!txRef) {
-        console.warn('[Webhook] No transaction_reference in payload — cannot process.');
-        return res.status(200).json({ received: true });
-      }
-
-      // Fetch our stored pending payment record to get creatorId and amount
+    if (isCollectionSuccess && txRef) {
       const pendingDoc = await db.collection('pendingPayments').doc(txRef).get();
 
       if (!pendingDoc.exists) {
-        // Could be a transaction we already processed — that's fine
-        console.log(`[Webhook] No pending record for ${txRef} — may already be processed.`);
+        // Already processed (webhook delivered twice) — safe to ignore
+        console.log(`[Webhook] No pending record for ${txRef} — already processed or unknown.`);
         return res.status(200).json({ received: true });
       }
 
       const pending = pendingDoc.data();
 
-      // Verify the transaction with Payaza before crediting
-      // Never credit based solely on the webhook payload
+      // Always verify server-side before crediting — never trust the payload alone
       let verifyResponse;
       try {
-        verifyResponse = await payaza.get(
-          `/merchant/api/v1/transaction/query?transaction_reference=${txRef}`
-        );
+        verifyResponse = await payaza.account.getTransactionStatus(txRef);
       } catch (verifyErr) {
         console.error(`[Webhook] Verification failed for ${txRef}:`, verifyErr.message);
         return res.status(200).json({ received: true, credited: false });
       }
 
-      if (verifyResponse.statusOk !== true || verifyResponse.paymentCompleted !== true) {
-        console.warn(`[Webhook] Payaza verify returned not-completed for ${txRef}.`);
+      const confirmed =
+        verifyResponse.statusOk === true && verifyResponse.paymentCompleted === true;
+
+      if (!confirmed) {
+        console.warn(`[Webhook] Payaza verify not confirmed for ${txRef} — skipping credit.`);
         return res.status(200).json({ received: true, credited: false });
       }
 
@@ -644,57 +617,69 @@ const handleWebhook = async (req, res) => {
       // Clean up the pending record
       await db.collection('pendingPayments').doc(txRef).delete();
 
-      console.log(`[Webhook] Credited ₦${pending.amount} to ${pending.creatorId} (ref: ${txRef}, new: ${credited})`);
+      console.log(`[Webhook] Credited ₦${pending.amount} to creator ${pending.creatorId} (ref: ${txRef}, wasNew: ${credited})`);
     }
 
-    // ── Transfer (payout) completion ──────────────────────────────────────────
-    // Payaza fires this after a bank transfer payout completes or fails.
-    // We update the withdrawal document status accordingly.
-    if (event === 'transfer.success' || event === 'transfer.failed') {
-      const txRef = data?.transaction_reference || data?.reference;
-      const succeeded = event === 'transfer.success';
+    // ── Transfer completion (creator payout) ──────────────────────────────────
+    // Fired when a Payaza bank transfer payout succeeds or fails.
+    // We match the event to our withdrawal document via payazaReference field.
+    const isTransferEvent =
+      event === 'transfer.success' ||
+      event === 'transfer.failed' ||
+      event === 'TRANSFER_SUCCESS' ||
+      event === 'TRANSFER_FAILED' ||
+      event === 'transfer.disburse';
 
-      if (txRef) {
-        const withdrawalSnap = await db
-          .collection('withdrawals')
-          .where('payazaReference', '==', txRef)
-          .limit(1)
-          .get();
+    if (isTransferEvent && txRef) {
+      const succeeded =
+        event === 'transfer.success' ||
+        event === 'TRANSFER_SUCCESS' ||
+        data?.status === 'SUCCESSFUL' ||
+        data?.status === 'NIP_SUCCESS';
 
-        if (!withdrawalSnap.empty) {
-          const withdrawalDoc = withdrawalSnap.docs[0];
-          const withdrawalData = withdrawalDoc.data();
+      const withdrawalSnap = await db
+        .collection('withdrawals')
+        .where('payazaReference', '==', txRef)
+        .limit(1)
+        .get();
 
-          await withdrawalDoc.ref.update({
-            status: succeeded ? 'completed' : 'failed',
-            failureReason: succeeded ? null : (data?.message || 'Transfer failed'),
-            updatedAt: new Date(),
-          });
+      if (!withdrawalSnap.empty) {
+        const withdrawalDoc = withdrawalSnap.docs[0];
+        const withdrawalData = withdrawalDoc.data();
 
-          // If the payout failed, refund the creator's wallet
-          if (!succeeded) {
-            const creatorRef = db.collection('creators').doc(withdrawalData.creatorId);
-            await db.runTransaction(async (firestoreTx) => {
-              const creatorDoc = await firestoreTx.get(creatorRef);
-              const creatorInfo = creatorDoc.data();
-              firestoreTx.update(creatorRef, {
-                walletBalance: creatorInfo.walletBalance + withdrawalData.amount,
-                updatedAt: new Date(),
-              });
+        await withdrawalDoc.ref.update({
+          status: succeeded ? 'completed' : 'failed',
+          failureReason: succeeded ? null : (data?.message || data?.complete_message || 'Transfer failed'),
+          updatedAt: new Date(),
+        });
+
+        if (!succeeded) {
+          // Payout failed — restore totalDeduction (amount + commission) to wallet
+          const creatorRef = db.collection('creators').doc(withdrawalData.creatorId);
+          await db.runTransaction(async (firestoreTx) => {
+            const creatorDoc = await firestoreTx.get(creatorRef);
+            const creatorInfo = creatorDoc.data();
+            // Refund the full totalDeduction (amount + any commission that was charged)
+            const refundAmount = withdrawalData.totalDeduction || withdrawalData.amount;
+            firestoreTx.update(creatorRef, {
+              walletBalance: creatorInfo.walletBalance + refundAmount,
+              updatedAt: new Date(),
             });
-            console.log(`[Webhook] Payout failed — refunded ₦${withdrawalData.amount} to creator ${withdrawalData.creatorId}`);
-          }
-
-          console.log(`[Webhook] Transfer ${txRef}: ${succeeded ? 'completed' : 'failed'}`);
+          });
+          console.log(`[Webhook] Transfer failed — refunded ₦${withdrawalData.totalDeduction || withdrawalData.amount} to creator ${withdrawalData.creatorId}`);
+        } else {
+          console.log(`[Webhook] Transfer completed for ref: ${txRef}`);
         }
+      } else {
+        console.warn(`[Webhook] No withdrawal found for payazaReference: ${txRef}`);
       }
     }
 
-    // Always return 200 so Payaza doesn't retry
+    // Always return 200 — Payaza retries on any other status
     return res.status(200).json({ received: true });
 
   } catch (err) {
-    // Never return 5xx to Payaza — it will keep retrying
+    // Never return 5xx to Payaza — it will keep retrying indefinitely
     console.error('[Webhook] Unexpected error:', err.message, err.stack);
     return res.status(200).json({ received: true, error: 'Internal processing error.' });
   }

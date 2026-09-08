@@ -1,117 +1,73 @@
 /**
  * config/payaza.js
  *
- * Payaza API configuration and shared HTTP client for KudiClap.
+ * Exports a singleton Payaza SDK client for use across all controllers.
  *
- * Payaza is our payment gateway — it handles:
- *   - Card collections (Visa, Mastercard, Verve) — via Web Checkout or Card Charge API
- *   - Virtual account / bank transfer collections
- *   - NGN bank transfers (payouts to creators)
+ * We now use the official payaza-node-sdk package instead of manual axios calls.
+ * The SDK handles:
+ *   - Base64-encoding the public key automatically
+ *   - Attaching the correct Authorization, X-TenantID, X-ProductID headers
+ *   - Throwing PayazaError on non-2xx responses (with .status and .response)
+ *   - TypeScript types (if we ever migrate to TS)
  *
- * ── Key Payaza differences from Flutterwave ───────────────────────────────────
+ * SDK client options:
+ *   publicKey   → your raw Payaza public key from the dashboard (not pre-encoded)
+ *   environment → "test" for sandbox (no real money), "live" for production
+ *   productId   → "app" — only required on mobile money collection endpoints
+ *   timeoutMs   → 30 seconds per request
  *
- *   1. NO SDK — all calls are plain HTTPS via axios (no npm package needed)
+ * Available namespaces on the client:
+ *   payaza.account            → view balances, nameEnquiry, getBankCodes, getTransactionStatus
+ *   payaza.transfers          → initiate, getStatus
+ *   payaza.cards              → charge, getTransactionStatus
+ *   payaza.virtualAccounts    → create, getStatus, getTransactionStatus
+ *   payaza.mobileMoneyCollections → collect, getTransactionStatus
+ *   payaza.subAccounts        → create, get
+ *   payaza.refunds            → initiate, getStatus, getHistory
  *
- *   2. Auth header format:
- *        Authorization: Payaza <Base64-encoded public key>
- *      NOT "Bearer" — it is literally the word "Payaza" followed by the key
+ * Also exported:
+ *   verifyWebhookSignature(rawBody, signature, secret)
+ *   → Verifies Payaza webhook HMAC-SHA512 signatures
+ *   → rawBody must be a Buffer (use express.raw() on the webhook route)
  *
- *   3. Two required extra headers on every request:
- *        X-TenantID:  "test" (sandbox) or "live" (production)
- *        X-ProductID: "app"  (always — this value never changes)
- *
- *   4. Single API base URL for both test and live:
- *        https://api.payaza.africa/live/
- *      The "/live/" is a fixed path prefix — it does NOT indicate environment.
- *      The X-TenantID header controls test vs live behaviour.
- *
- *   5. Webhook signature uses a different scheme — see paymentController.js
- *
- * ── How to get your API keys ───────────────────────────────────────────────────
- *   1. Sign up / log in at business.payaza.africa
- *   2. Settings → Developers → API Keys → Generate
- *   3. Copy both test and live public keys to your .env file
- *
- * Usage:
- *   const payaza = require('../config/payaza');
- *   const response = await payaza.post('/endpoint', { ...payload });
+ * Usage in controllers:
+ *   const { payaza, verifyWebhookSignature } = require('../config/payaza');
+ *   const result = await payaza.transfers.initiate({ ... });
+ *   const isValid = verifyWebhookSignature(req.body, sig, secret);
  */
 
-const axios = require('axios');
+const { Payaza, verifyWebhookSignature } = require('payaza-node-sdk');
 
-// ── Payaza API base URL ────────────────────────────────────────────────────────
-// This is fixed — the "/live/" segment is a path prefix, not an environment flag.
-// The X-TenantID header controls whether the request is test or live.
-const PAYAZA_BASE_URL = 'https://api.payaza.africa/live';
+// ── Validate that the required env var is present at startup ──────────────────
+// Fail fast — better to crash on boot than get a confusing runtime error
+// deep inside a payment flow.
+if (!process.env.PAYAZA_PUBLIC_KEY) {
+  // In test environments (e.g. CI without .env) just warn, don't crash
+  // In production this MUST be set or payments will fail
+  console.warn('[Payaza] WARNING: PAYAZA_PUBLIC_KEY is not set in environment variables.');
+}
 
-// ── Build the Authorization header value ──────────────────────────────────────
-// Payaza requires: "Payaza <Base64-encoded public API key>"
-// We encode the key at startup (not per-request) so it's computed once.
-const getAuthHeader = () => {
-  const publicKey = process.env.PAYAZA_PUBLIC_KEY;
+// ── Create the singleton Payaza SDK client ────────────────────────────────────
+// We create ONE instance at module load time and reuse it everywhere.
+// This avoids creating a new client on every request (wasteful) and
+// ensures all API calls share the same configuration.
+const payaza = new Payaza({
+  // The raw public key from business.payaza.africa → Settings → Developers
+  // The SDK base64-encodes it and prepends "Payaza " automatically on every request
+  publicKey: process.env.PAYAZA_PUBLIC_KEY || '',
 
-  if (!publicKey) {
-    throw new Error('PAYAZA_PUBLIC_KEY is not set in environment variables.');
-  }
+  // "test" sends requests to Payaza's sandbox — no real money moves
+  // "live" sends real transactions — only switch when going to production
+  environment: (process.env.PAYAZA_ENV === 'live' ? 'live' : 'test'),
 
-  // Buffer.from().toString('base64') encodes the key to Base64
-  const encoded = Buffer.from(publicKey).toString('base64');
+  // X-ProductID header — required on mobile money collection endpoints
+  // "app" is the default and correct value for KudiClap
+  productId: 'app',
 
-  // The word "Payaza" is literally part of the header value (not "Bearer")
-  return `Payaza ${encoded}`;
-};
-
-// ── Build the shared request headers ──────────────────────────────────────────
-// These three headers are required on EVERY Payaza API request.
-const getHeaders = () => ({
-  'Authorization': getAuthHeader(),
-  'X-TenantID': process.env.PAYAZA_ENV || 'test',  // 'test' or 'live'
-  'X-ProductID': 'app',                            // Always 'app' — never changes
-  'Content-Type': 'application/json',
+  // Per-request timeout — 30 seconds is generous but safe for Africa networks
+  timeoutMs: 30_000,
 });
 
-// ── Create a pre-configured axios instance ─────────────────────────────────────
-// This lets controllers call payaza.post(), payaza.get() etc. without
-// manually setting headers on every single request.
-//
-// We use a factory function (not a singleton) so headers are freshly built
-// on each call — this ensures env vars are always read from the current
-// process.env (important if keys are rotated without restarting the server).
-const createPayazaClient = () => {
-  return axios.create({
-    baseURL: PAYAZA_BASE_URL,
-    headers: getHeaders(),
-    // 30-second timeout — Payaza's API is typically fast but we set a ceiling
-    // to avoid hanging requests blocking the event loop
-    timeout: 30000,
-  });
-};
-
-/**
- * Exported helper — make a POST request to the Payaza API.
- *
- * @param {string} endpoint - Path after the base URL, e.g. '/merchant/api/v1/card/charge'
- * @param {object} data     - Request body (will be JSON-serialized)
- * @returns {Promise<object>} - Payaza response data
- * @throws Will throw if the HTTP request fails (network error or non-2xx status)
- */
-const post = async (endpoint, data) => {
-  const client = createPayazaClient();
-  const response = await client.post(endpoint, data);
-  return response.data;
-};
-
-/**
- * Exported helper — make a GET request to the Payaza API.
- *
- * @param {string} endpoint - Path after the base URL
- * @param {object} params   - Optional query parameters
- * @returns {Promise<object>} - Payaza response data
- */
-const get = async (endpoint, params = {}) => {
-  const client = createPayazaClient();
-  const response = await client.get(endpoint, { params });
-  return response.data;
-};
-
-module.exports = { post, get, getHeaders, PAYAZA_BASE_URL };
+// Export both the client and the webhook verification helper so controllers
+// don't need to import from the SDK directly
+module.exports = { payaza, verifyWebhookSignature };

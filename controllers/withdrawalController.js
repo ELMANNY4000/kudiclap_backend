@@ -1,70 +1,95 @@
 /**
  * controllers/withdrawalController.js
  *
- * Production-grade creator payout processing — powered by Payaza Transfers.
+ * Creator payout processing — powered by the Payaza Node.js SDK.
  *
  * ── Withdrawal flow ────────────────────────────────────────────────────────────
  *
- *   1. Creator submits: { creatorId, amount, pin }
- *   2. Validate input + verify PIN (bcrypt compare against stored hash)
- *   3. Calculate commission (from Firestore commissions collection)
- *   4. Check walletBalance >= amount + commission
- *   5. Atomically deduct wallet + create withdrawal doc (status: pending)
- *   6. Fetch Payaza account reference
- *   7. Call Payaza Transfer API (nuban for Nigerian bank accounts)
- *   8. On Payaza failure: reverse deduction, mark withdrawal failed
- *   9. Final status via transfer.success / transfer.failed webhook
+ *   1. Creator submits { creatorId, amount, pin }
+ *   2. Validate input + verify 4-digit PIN (bcrypt compare)
+ *   3. Calculate commission from Firestore commissions collection
+ *   4. Check walletBalance >= totalDeduction (amount + commission)
+ *   5. Atomically deduct totalDeduction from wallet + create withdrawal doc
+ *   6. Fetch our Payaza account reference via payaza.account.view()
+ *   7. Initiate payout via payaza.transfers.initiate()
+ *   8. On failure: atomically reverse deduction + mark withdrawal failed
+ *   9. Final confirmation via transfer.success/failed webhook in paymentController
  *
- * ── PIN requirement ───────────────────────────────────────────────────────────
- *   Every withdrawal requires the creator's 4-digit PIN (set via /api/auth/set-pin).
- *   This is separate from their login password — it is an application-level
- *   authorization check stored as a bcrypt hash in Firestore.
+ * ── SDK methods used ──────────────────────────────────────────────────────────
  *
- * ── Commission deduction ─────────────────────────────────────────────────────
- *   Commission is fetched from the commissions Firestore collection.
- *   The commission amount is deducted from the wallet in addition to the
- *   withdrawal amount. If no commission is configured, none is deducted.
+ *   payaza.account.view()
+ *     → Returns all currency sub-accounts. We find the NGN one and extract
+ *       payazaAccountReference — required in every transfer request.
  *
- * Exported functions:
+ *   payaza.transfers.initiate(payload)
+ *     → Queues a NUBAN bank transfer to the creator's account.
+ *     → Returns { data: { id, reference, status: 'NEW', ... } }
+ *     → Status 'NEW' means queued — webhook fires when it completes.
+ *
+ *   payaza.transfers.getStatus(reference)
+ *     → Checks the current status of a transfer by our reference.
+ *     → Used in getWithdrawalStatus() to poll if webhook was delayed.
+ *
+ * ── Transaction_reference format ─────────────────────────────────────────────
+ *   Payaza requires unique references >= 10 characters.
+ *   We use: kc-wd-{10 chars of withdrawalId}-{4 digit timestamp}
+ *   This stays <= 25 chars (narration limit) and is traceable back to Firestore.
+ *
+ * Exported:
  *   - requestWithdrawal      → POST /api/withdrawals
  *   - getCreatorWithdrawals  → GET  /api/withdrawals/:creatorId
  *   - getWithdrawalStatus    → GET  /api/withdrawals/status/:withdrawalId
  */
 
 const bcrypt = require('bcrypt');
-const payaza = require('../config/payaza');
+const { payaza } = require('../config/payaza');
+const { PayazaError } = require('payaza-node-sdk');
 const { db } = require('../config/firebase');
 const { validateWithdrawal } = require('../utils/validation');
 const { calculateCommission } = require('../services/commissionService');
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Internal helper — fetch our Payaza account reference
+// Internal helper — get our NGN Payaza account reference
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Fetches KudiClap's Payaza account reference for NGN.
+ * Fetches KudiClap's NGN Payaza account reference.
  *
- * The payazaAccountReference is required in every transfer request — it tells
- * Payaza which of our wallets to debit. This changes per currency, so we
- * always fetch it fresh rather than hardcoding it.
+ * payaza.account.view() returns all currency sub-accounts under our business.
+ * We find the NGN one and extract payazaAccountReference — Payaza requires
+ * this on every transfer request to know which wallet to debit.
  *
- * @returns {Promise<string>} The payazaAccountReference for NGN
- * @throws If the API call fails or the NGN account is not found
+ * @returns {Promise<string>} The NGN payazaAccountReference
+ * @throws  If the API call fails or no NGN account is found
  */
-const getPayazaAccountReference = async () => {
-  const response = await payaza.get('/payaza-account/api/v1/account/details');
+const getNgnAccountReference = async () => {
+  // SDK call — throws PayazaError on non-2xx
+  const response = await payaza.account.view();
 
-  // Response contains an array of currency accounts — find NGN
-  const accounts = response.data || response;
-  const ngnAccount = Array.isArray(accounts)
-    ? accounts.find((acc) => acc.currency === 'NGN' || acc.currency_code === 'NGN')
-    : accounts;
+  // response.data is an array of account objects, one per currency
+  const accounts = Array.isArray(response.data) ? response.data : [response.data];
 
-  if (!ngnAccount || !ngnAccount.payazaAccountReference) {
-    throw new Error('Could not retrieve NGN Payaza account reference. Check your dashboard.');
+  const ngnAccount = accounts.find(
+    (acc) =>
+      acc.currency === 'NGN' ||
+      acc.currency_code === 'NGN' ||
+      acc.accountCurrency === 'NGN'
+  );
+
+  if (!ngnAccount) {
+    throw new Error('No NGN account found on your Payaza dashboard. Please contact support.');
   }
 
-  return ngnAccount.payazaAccountReference;
+  const ref =
+    ngnAccount.payazaAccountReference ||
+    ngnAccount.account_reference ||
+    ngnAccount.accountReference;
+
+  if (!ref) {
+    throw new Error('NGN account found but payazaAccountReference is missing. Contact support.');
+  }
+
+  return ref;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -72,25 +97,14 @@ const getPayazaAccountReference = async () => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Processes a withdrawal request — sends real money to the creator's bank account.
- *
- * Steps:
- *   1. Validate input (creatorId, amount — minimum ₦500)
- *   2. Ownership check — creator can only withdraw from their own wallet
- *   3. Load creator, check balance
- *   4. Atomically deduct walletBalance + create withdrawal doc (status: pending)
- *   5. Fetch our Payaza account reference
- *   6. Call Payaza Transfer API to initiate the payout
- *   7. Update withdrawal doc with Payaza's transfer reference
- *   8. If Payaza fails, reverse the deduction immediately
- *   9. Final status comes via transfer.success / transfer.failed webhook
+ * Processes a withdrawal — sends real money to the creator's Nigerian bank account.
  *
  * @route  POST /api/withdrawals
- * @access Private — protect middleware required
+ * @access Private — protect middleware (creator must be logged in)
  */
 const requestWithdrawal = async (req, res, next) => {
   try {
-    // ── Validate request body ─────────────────────────────────────────────────
+    // ── Validate ──────────────────────────────────────────────────────────────
     const { error, value } = validateWithdrawal(req.body);
     if (error) {
       return res.status(400).json({ success: false, error: error.details[0].message });
@@ -106,7 +120,7 @@ const requestWithdrawal = async (req, res, next) => {
       });
     }
 
-    // ── Fetch creator profile ─────────────────────────────────────────────────
+    // ── Fetch creator ─────────────────────────────────────────────────────────
     const creatorRef = db.collection('creators').doc(creatorId);
     const creatorDoc = await creatorRef.get();
 
@@ -116,12 +130,13 @@ const requestWithdrawal = async (req, res, next) => {
 
     const creatorData = creatorDoc.data();
 
-    // ── Verify PIN ────────────────────────────────────────────────────────────
-    // PIN is required for every withdrawal — it is separate from the login password
+    // ── PIN verification ──────────────────────────────────────────────────────
+    // The PIN is stored as a bcrypt hash in Firestore.
+    // It is separate from the Firebase Auth login password.
     if (!creatorData.pin) {
       return res.status(400).json({
         success: false,
-        error: 'No withdrawal PIN set. Please set your PIN at /api/auth/set-pin first.',
+        error: 'No withdrawal PIN set. Please set your PIN at POST /api/auth/set-pin first.',
       });
     }
 
@@ -130,18 +145,19 @@ const requestWithdrawal = async (req, res, next) => {
       return res.status(400).json({ success: false, error: 'Invalid PIN.' });
     }
 
-    // ── Check bank account details are set ───────────────────────────────────
+    // ── Bank account check ────────────────────────────────────────────────────
     if (!creatorData.bankAccountNumber || !creatorData.bankCode) {
       return res.status(400).json({
         success: false,
-        error: 'No bank account on file. Please add your bank account at PUT /api/creators/:id/bank.',
+        error: 'No bank account on file. Add your account at PUT /api/creators/:id/bank first.',
       });
     }
 
-    // ── Calculate commission ──────────────────────────────────────────────────
+    // ── Commission calculation ────────────────────────────────────────────────
+    // Rates come from the Firestore "commissions" collection — zero by default.
     const { commission, totalDeduction, breakdown } = await calculateCommission(amount, 'withdraw');
 
-    // ── Pre-check balance (including commission) ──────────────────────────────
+    // ── Balance check (pre-transaction quick check) ───────────────────────────
     if (creatorData.walletBalance < totalDeduction) {
       return res.status(400).json({
         success: false,
@@ -149,52 +165,57 @@ const requestWithdrawal = async (req, res, next) => {
       });
     }
 
-    // ── Generate a unique Payaza transfer reference ───────────────────────────
-    // Payaza requires a unique transaction_reference per transfer.
-    // We use the withdrawal doc ID so we can match webhook events back to it.
+    // ── Prepare IDs and references ────────────────────────────────────────────
     const withdrawalRef = db.collection('withdrawals').doc();
     const withdrawalId = withdrawalRef.id;
+
+    // Payaza reference — unique, >= 10 chars, <= 25 chars for narration
     const payazaReference = `kc-wd-${withdrawalId.substring(0, 10)}-${Date.now().toString().slice(-4)}`;
 
-    // ── Atomic Firestore: deduct balance + record withdrawal ──────────────────
+    // ── Atomic Firestore: deduct wallet + create withdrawal record ────────────
+    // Both writes succeed together or both roll back.
+    // The wallet deduction acts as a concurrency lock — prevents a second
+    // withdrawal request from passing the balance check simultaneously.
     let newWalletBalance;
 
     try {
       await db.runTransaction(async (firestoreTx) => {
+        // Re-read inside the transaction — gets the freshest balance
         const freshDoc = await firestoreTx.get(creatorRef);
         const freshData = freshDoc.data();
 
-        // Re-check inside the transaction — balance may have changed
-        if (amount > freshData.walletBalance) {
+        // Re-check balance inside the transaction (may have changed since pre-check)
+        if (freshData.walletBalance < totalDeduction) {
           throw Object.assign(
             new Error(`Insufficient balance. Available: ₦${freshData.walletBalance.toLocaleString()}`),
             { statusCode: 400 }
           );
         }
 
-        newWalletBalance = freshData.walletBalance - amount;
+        newWalletBalance = freshData.walletBalance - totalDeduction;
 
-        // Deduct from wallet (this is the race-condition lock)
+        // Deduct the full totalDeduction (amount + commission) from wallet
         firestoreTx.update(creatorRef, {
           walletBalance: newWalletBalance,
           updatedAt: new Date(),
         });
 
-        // Record the withdrawal document with pending status
+        // Create the withdrawal document — status starts as 'pending'
+        // It is updated to 'completed' or 'failed' by the webhook handler
         firestoreTx.set(withdrawalRef, {
           id: withdrawalId,
           creatorId,
-          amount,
-          commission,
-          totalDeduction,
+          amount,                       // The amount the creator receives
+          commission,                   // Fee deducted on top
+          totalDeduction,               // amount + commission — what left the wallet
           commissionBreakdown: breakdown,
           bankAccountNumber: creatorData.bankAccountNumber,
           bankCode: creatorData.bankCode,
           bankName: creatorData.bankName || '',
           accountName: creatorData.bankAccountName || creatorData.name,
-          status: 'pending',            // Updated to completed/failed via webhook
-          payazaReference,              // Our unique ref — used to match webhook events
-          payazaTransferId: null,       // Set after Payaza responds
+          status: 'pending',
+          payazaReference,              // Matches this to webhook transfer events
+          payazaTransferId: null,       // Set after SDK call responds
           timestamp: new Date(),
           updatedAt: new Date(),
         });
@@ -206,80 +227,86 @@ const requestWithdrawal = async (req, res, next) => {
       throw txError;
     }
 
-    // ── Fetch our Payaza account reference ────────────────────────────────────
-    let payazaAccountReference;
-    try {
-      payazaAccountReference = await getPayazaAccountReference();
-    } catch (accError) {
-      // Reverse the deduction — can't proceed without the account reference
-      await db.runTransaction(async (firestoreTx) => {
-        const freshDoc = await firestoreTx.get(creatorRef);
-        firestoreTx.update(creatorRef, {
-          walletBalance: freshDoc.data().walletBalance + totalDeduction, // restore amount + commission
-          updatedAt: new Date(),
+    // ── Helper: reverse the Firestore deduction on any downstream failure ──────
+    // Restores totalDeduction (amount + commission) to the creator's wallet
+    // and marks the withdrawal as failed.
+    const reverseDeduction = async (reason) => {
+      try {
+        await db.runTransaction(async (firestoreTx) => {
+          const freshDoc = await firestoreTx.get(creatorRef);
+          firestoreTx.update(creatorRef, {
+            walletBalance: freshDoc.data().walletBalance + totalDeduction,
+            updatedAt: new Date(),
+          });
+          firestoreTx.update(withdrawalRef, {
+            status: 'failed',
+            failureReason: reason,
+            updatedAt: new Date(),
+          });
         });
-        firestoreTx.update(withdrawalRef, {
-          status: 'failed',
-          failureReason: accError.message,
-          updatedAt: new Date(),
-        });
-      });
+        console.log(`[Withdrawal] Reversed ₦${totalDeduction} for ${withdrawalId}: ${reason}`);
+      } catch (reverseErr) {
+        // Log but don't throw — we're already in an error path
+        console.error('[Withdrawal] CRITICAL: failed to reverse deduction:', reverseErr.message);
+      }
+    };
 
+    // ── Fetch Payaza account reference ────────────────────────────────────────
+    let accountReference;
+    try {
+      accountReference = await getNgnAccountReference();
+    } catch (accError) {
+      await reverseDeduction(accError.message);
       return res.status(502).json({
         success: false,
         error: 'Could not connect to payment gateway. Your balance has been restored. Please try again.',
       });
     }
 
-    // ── Call Payaza Transfer API ──────────────────────────────────────────────
+    // ── Initiate the Payaza transfer ──────────────────────────────────────────
+    // payaza.transfers.initiate() — SDK call, throws PayazaError on failure
+    //
     // transaction_type: "nuban" = Nigerian bank account (NUBAN standard)
-    // All NGN transfers use nuban — regardless of whether it's a traditional
-    // bank, OPay, PalmPay, or Kuda (they all have NUBAN account numbers).
+    // Works for all Nigerian banks including OPay (999992), Kuda (090267),
+    // PalmPay (999991), and traditional banks like Access (044), GTBank (058).
     const transferPayload = {
       transaction_type: 'nuban',
       service_payload: {
         payout_amount: amount,
-        transaction_pin: process.env.PAYAZA_TRANSACTION_PIN, // Set in dashboard + .env
-        account_reference: payazaAccountReference,           // Our Payaza wallet ref
+        // 6-digit PIN set in the Payaza dashboard — authorises the payout
+        transaction_pin: parseInt(process.env.PAYAZA_TRANSACTION_PIN, 10),
+        account_reference: accountReference,
         currency: 'NGN',
-        country: 'NGA',
-      },
-      payout_beneficiaries: [
-        {
-          credit_amount: amount,
-          account_number: creatorData.bankAccountNumber,  // Creator's NUBAN account
-          account_name: creatorData.bankAccountName || creatorData.name,
-          bank_code: creatorData.bankCode,                // e.g. "044" for Access Bank
-          transaction_reference: payazaReference,         // Our unique ref
-          narration: `KudiClap payout to ${creatorData.name}`,
-          sender: {
-            sender_name: 'KudiClap',
-            sender_phone_number: '08000000000', // KudiClap's registered business number
-            sender_address: 'Nigeria',
+        payout_beneficiaries: [
+          {
+            credit_amount: amount,
+            account_number: creatorData.bankAccountNumber,
+            account_name: creatorData.bankAccountName || creatorData.name,
+            bank_code: creatorData.bankCode,
+            // Narration shown on creator's bank statement (keep <= 25 chars)
+            narration: `KudiClap payout`,
+            // Our unique ref — used to match this transfer in webhook events
+            transaction_reference: payazaReference,
+            sender: {
+              sender_name: 'KudiClap',
+              sender_phone_number: process.env.KUDICLAP_PHONE || '08000000000',
+              sender_address: 'Nigeria',
+            },
           },
-        },
-      ],
+        ],
+      },
     };
 
     let transferResponse;
     try {
-      transferResponse = await payaza.post('/api/v1/transfers/initiate-transfer', transferPayload);
+      transferResponse = await payaza.transfers.initiate(transferPayload);
     } catch (payazaError) {
-      // ── Payaza rejected the transfer — reverse the wallet deduction ──────────
-      console.error(`[Withdrawal] Payaza Transfer error for ${withdrawalId}:`, payazaError.response?.data || payazaError.message);
+      const errMsg = payazaError instanceof PayazaError
+        ? payazaError.message
+        : payazaError.message;
 
-      await db.runTransaction(async (firestoreTx) => {
-        const freshDoc = await firestoreTx.get(creatorRef);
-        firestoreTx.update(creatorRef, {
-          walletBalance: freshDoc.data().walletBalance + totalDeduction,
-          updatedAt: new Date(),
-        });
-        firestoreTx.update(withdrawalRef, {
-          status: 'failed',
-          failureReason: payazaError.response?.data?.message || payazaError.message,
-          updatedAt: new Date(),
-        });
-      });
+      console.error(`[Withdrawal] SDK transfer error for ${withdrawalId}:`, errMsg);
+      await reverseDeduction(errMsg);
 
       return res.status(502).json({
         success: false,
@@ -287,12 +314,12 @@ const requestWithdrawal = async (req, res, next) => {
       });
     }
 
-    // ── Payaza accepted the transfer ──────────────────────────────────────────
-    // The transfer is now queued — final confirmation comes via webhook.
-    const payazaTransferId = transferResponse?.data?.id || transferResponse?.transfer_id;
+    // ── Update withdrawal doc with Payaza's transfer ID ───────────────────────
+    // transferResponse.data.id is Payaza's internal ID (e.g. "trf_XXXXX")
+    const payazaTransferId = transferResponse?.data?.id || null;
 
     await withdrawalRef.update({
-      payazaTransferId: payazaTransferId || null,
+      payazaTransferId,
       updatedAt: new Date(),
     });
 
@@ -326,7 +353,7 @@ const requestWithdrawal = async (req, res, next) => {
  * Supports ?limit query param (default 20, max 100).
  *
  * @route  GET /api/withdrawals/:creatorId
- * @access Private — protect + isSameUser in route
+ * @access Private — protect + isSameUser
  */
 const getCreatorWithdrawals = async (req, res, next) => {
   try {
@@ -360,9 +387,9 @@ const getCreatorWithdrawals = async (req, res, next) => {
 /**
  * Returns the current status of a specific withdrawal.
  *
- * For pending withdrawals with a Payaza transfer reference, we query Payaza
- * directly to get the latest status — useful if the webhook was delayed.
- * If Payaza confirms failure, we auto-refund the creator's wallet here.
+ * For pending withdrawals, polls Payaza via payaza.transfers.getStatus()
+ * to get the latest status without waiting for a webhook.
+ * Auto-refunds the creator if Payaza confirms a failure.
  *
  * @route  GET /api/withdrawals/status/:withdrawalId
  * @access Private — protect middleware
@@ -372,14 +399,13 @@ const getWithdrawalStatus = async (req, res, next) => {
     const { withdrawalId } = req.params;
 
     const withdrawalDoc = await db.collection('withdrawals').doc(withdrawalId).get();
-
     if (!withdrawalDoc.exists) {
       return res.status(404).json({ success: false, error: 'Withdrawal not found.' });
     }
 
     const withdrawalData = withdrawalDoc.data();
 
-    // ── Ownership check ───────────────────────────────────────────────────────
+    // Ownership check
     if (req.user.uid !== withdrawalData.creatorId) {
       return res.status(403).json({
         success: false,
@@ -387,48 +413,43 @@ const getWithdrawalStatus = async (req, res, next) => {
       });
     }
 
-    // ── For pending withdrawals, query Payaza directly ────────────────────────
+    // ── Poll Payaza for pending withdrawals ───────────────────────────────────
     if (withdrawalData.status === 'pending' && withdrawalData.payazaReference) {
       try {
-        const statusResponse = await payaza.get(
-          `/api/v1/transfers/transaction-status?transaction_reference=${withdrawalData.payazaReference}`
-        );
-
+        // payaza.transfers.getStatus(reference) — SDK call
+        const statusResponse = await payaza.transfers.getStatus(withdrawalData.payazaReference);
         const payazaStatus = statusResponse?.data?.status || statusResponse?.status;
 
-        if (payazaStatus === 'NIP_SUCCESS' || payazaStatus === 'TRANSACTION_SUCCESSFUL') {
-          // Payout confirmed — update Firestore record
+        if (payazaStatus === 'NIP_SUCCESS' || payazaStatus === 'TRANSACTION_SUCCESSFUL' || payazaStatus === 'SUCCESSFUL') {
           await withdrawalDoc.ref.update({ status: 'completed', updatedAt: new Date() });
           withdrawalData.status = 'completed';
 
-        } else if (payazaStatus === 'NIP_FAILURE' || payazaStatus === 'TRANSACTION_FAILED') {
-          // Payout failed — refund the creator
+        } else if (payazaStatus === 'NIP_FAILURE' || payazaStatus === 'TRANSACTION_FAILED' || payazaStatus === 'FAILED') {
+          // Payout failed — refund totalDeduction back to creator's wallet
           const creatorRef = db.collection('creators').doc(withdrawalData.creatorId);
+          const refundAmount = withdrawalData.totalDeduction || withdrawalData.amount;
 
           await db.runTransaction(async (firestoreTx) => {
             const creatorDoc = await firestoreTx.get(creatorRef);
-            const creatorInfo = creatorDoc.data();
-
             firestoreTx.update(creatorRef, {
-              walletBalance: creatorInfo.walletBalance + withdrawalData.amount,
+              walletBalance: creatorDoc.data().walletBalance + refundAmount,
               updatedAt: new Date(),
             });
-
             firestoreTx.update(withdrawalDoc.ref, {
               status: 'failed',
-              failureReason: statusResponse?.data?.message || 'Transfer failed',
+              failureReason: statusResponse?.data?.complete_message || 'Transfer failed',
               updatedAt: new Date(),
             });
           });
 
           withdrawalData.status = 'failed';
-          console.log(`[Withdrawal Status] Auto-refunded ₦${withdrawalData.amount} to creator ${withdrawalData.creatorId}`);
+          console.log(`[Withdrawal Status] Auto-refunded ₦${refundAmount} to creator ${withdrawalData.creatorId}`);
         }
-        // NIP_PENDING — still processing, return current status
+        // 'NEW' or 'PENDING' — still processing, return current status
 
       } catch (statusError) {
-        // Can't reach Payaza — return what we have in Firestore
-        console.warn(`[Withdrawal Status] Could not query Payaza for ${withdrawalId}:`, statusError.message);
+        // Payaza unreachable — return what we have in Firestore
+        console.warn(`[Withdrawal Status] Could not poll Payaza for ${withdrawalId}:`, statusError.message);
       }
     }
 
@@ -437,6 +458,8 @@ const getWithdrawalStatus = async (req, res, next) => {
       data: {
         id: withdrawalData.id,
         amount: withdrawalData.amount,
+        commission: withdrawalData.commission,
+        totalDeducted: withdrawalData.totalDeduction,
         status: withdrawalData.status,
         bankAccountNumber: withdrawalData.bankAccountNumber,
         bankName: withdrawalData.bankName,
