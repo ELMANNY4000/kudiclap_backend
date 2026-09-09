@@ -42,6 +42,7 @@
 const bcrypt = require('bcrypt');
 const { db } = require('../config/firebase');
 const { validateRequestOtp, validateVerifyOtp, validateResetPin } = require('../utils/validation');
+const { sendOtp: sendOtpEmail } = require('../services/emailService');
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Internal helper — generate a 6-digit OTP
@@ -135,11 +136,18 @@ const requestOtp = async (req, res, next) => {
     });
 
     // ── Email delivery ────────────────────────────────────────────────────────
-    // TODO: Send the OTP via email using nodemailer / SendGrid / Resend.
-    // Example (nodemailer setup goes in services/emailService.js):
-    //   await emailService.sendOtp({ to: email, otp: rawOtpCode, purpose });
-    //
-    // For MVP: log the OTP and optionally return it in the response
+    // Send the OTP to the creator's email via emailService (nodemailer).
+    // sendOtpEmail() falls back to console.log() if EMAIL_HOST is not set.
+    const creatorSnap = await db.collection('creators').doc(creatorId).get();
+    const creatorName = creatorSnap.exists ? creatorSnap.data().name : 'Creator';
+
+    await sendOtpEmail({
+      to: email,
+      otpCode: rawOtpCode,
+      purpose,
+      name: creatorName,
+    });
+
     console.log(`[OTP] Generated for ${email} (${purpose}): ${rawOtpCode} (ID: ${otpRef.id})`);
 
     const responseData = {

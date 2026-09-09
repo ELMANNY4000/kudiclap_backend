@@ -47,6 +47,7 @@ const { PayazaError } = require('payaza-node-sdk');
 const { db } = require('../config/firebase');
 const { validateWithdrawal } = require('../utils/validation');
 const { calculateCommission } = require('../services/commissionService');
+const { sendWithdrawalUpdate } = require('../services/emailService');
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Internal helper — get our NGN Payaza account reference
@@ -324,6 +325,16 @@ const requestWithdrawal = async (req, res, next) => {
     });
 
     console.log(`[Withdrawal] Initiated: creatorId=${creatorId}, ₦${amount}, ref=${payazaReference}, payazaId=${payazaTransferId}`);
+
+    // ── Email notification ──────────────────────────────────────────────────
+    // Fire-and-forget — don't let email failure block the response
+    sendWithdrawalUpdate({
+      to:          creatorData.email,
+      creatorName: creatorData.name,
+      amount,
+      status:      'pending',
+      bankName:    creatorData.bankName || 'your bank account',
+    }).catch((err) => console.error('[Withdrawal] Email failed:', err.message));
 
     return res.status(200).json({
       success: true,

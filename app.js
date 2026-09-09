@@ -23,12 +23,13 @@ const morgan = require('morgan');
 const rateLimit = require('express-rate-limit');
 
 // ── Route handlers ────────────────────────────────────────────────────────────
-const authRoutes = require('./routes/authRoutes');         // signup, login, logout, me
-const creatorRoutes = require('./routes/creatorRoutes');   // profile reads + updates
-const paymentRoutes = require('./routes/paymentRoutes');   // tip + webhook
-const ussdRoutes = require('./routes/ussdRoutes');         // USSD simulation
-const withdrawalRoutes = require('./routes/withdrawalRoutes'); // cash-out
-const transactionRoutes = require('./routes/transactionRoutes'); // tip history
+const authRoutes        = require('./routes/authRoutes');         // signup, login, logout, me, PIN, OTP
+const creatorRoutes     = require('./routes/creatorRoutes');      // profile reads + updates + bank account
+const paymentRoutes     = require('./routes/paymentRoutes');      // tip, webhook, card-callback, banks, enquire
+const ussdRoutes        = require('./routes/ussdRoutes');         // USSD tip + USSD withdrawal
+const withdrawalRoutes  = require('./routes/withdrawalRoutes');   // cash-out requests + history
+const transactionRoutes = require('./routes/transactionRoutes');  // tip history + summary
+const adminRoutes       = require('./routes/adminRoutes');        // admin: commissions, stats
 
 // ── Global error middleware (must be imported for use at the bottom) ───────────
 const errorMiddleware = require('./middlewares/errorMiddleware');
@@ -176,12 +177,13 @@ app.get('/health', (req, res) => {
 // /api/withdrawals  → cash-out requests + history
 // /api/transactions → tip history
 // ─────────────────────────────────────────────────────────────────────────────
-app.use('/api/auth', authLimiter, authRoutes);
-app.use('/api/creators', creatorRoutes);
-app.use('/api/payments', paymentLimiter, paymentRoutes);
-app.use('/api/ussd', paymentLimiter, ussdRoutes);
+app.use('/api/auth',         authLimiter, authRoutes);
+app.use('/api/creators',    creatorRoutes);
+app.use('/api/payments',    paymentLimiter, paymentRoutes);
+app.use('/api/ussd',        paymentLimiter, ussdRoutes);
 app.use('/api/withdrawals', withdrawalRoutes);
-app.use('/api/transactions', transactionRoutes);
+app.use('/api/transactions',transactionRoutes);
+app.use('/api/admin',       adminRoutes);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 404 Handler

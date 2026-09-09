@@ -26,7 +26,7 @@
     "firebase-admin": "^12.2.0",
     "joi": "^17.13.1",
     "morgan": "^1.10.0",
-    "payaza-node-sdk": "^0.1.0",
+    "nodemailer": "^10.0.1",
     "payaza-node-sdk": "^0.1.1"
   },
   "devDependencies": {

@@ -1,47 +1,50 @@
 /**
  * routes/transactionRoutes.js
  *
- * Defines all HTTP routes for reading transaction (tip) history.
+ * Transaction history routes for KudiClap creators.
  *
- * Base path: /api/transactions  (set in app.js)
+ * Base path: /api/transactions  (registered in app.js)
+ *
+ * All routes require authentication — creators can only access their own data.
+ *
+ * Route ordering matters — specific paths before wildcard params:
+ *   /single/:id and /:creatorId/summary MUST come before /:creatorId
+ *   otherwise Express would match "single" or the ID as :creatorId.
  *
  * Routes:
- *   GET /api/transactions/:creatorId          → All transactions for a creator
- *   GET /api/transactions/single/:id          → A single transaction by its ID
+ *   GET /api/transactions/single/:id            → one transaction by Firestore ID
+ *   GET /api/transactions/:creatorId/summary    → aggregated stats (total, by method)
+ *   GET /api/transactions/:creatorId            → full history (paginated, filterable)
  *
- * Query params supported on /:creatorId:
- *   ?limit=20       → how many results to return (default 20, max 100)
- *   ?method=card    → filter by payment method (card, mobileMoney, ussd)
- *
- * Example:
- *   GET /api/transactions/abc123?limit=50&method=mobileMoney
- *   → Returns the last 50 mobile money tips for creator abc123
- *
- * Route ordering note:
- *   /single/:id MUST come before /:creatorId — otherwise Express matches
- *   "single" as the :creatorId value, which would return no results.
+ * Query params on /:creatorId:
+ *   ?limit=20       → results per page (default 20, max 100)
+ *   ?method=card    → filter by paymentMethod
+ *   ?after=<ISO>    → cursor for next page (pass last item's timestamp)
  */
 
 const express = require('express');
 const router = express.Router();
 
-// Controller functions
 const {
   getCreatorTransactions,
   getSingleTransaction,
+  getTransactionSummary,
 } = require('../controllers/transactionController');
 
-// Auth middleware
 const { protect } = require('../middlewares/authMiddleware');
 
 // GET /api/transactions/single/:id
-// Returns one specific transaction — useful for viewing tip details
-// Must be defined BEFORE /:creatorId to avoid route collision
+// Single transaction by Firestore document ID — ownership check inside controller
+// MUST be before /:creatorId to avoid route collision
 router.get('/single/:id', protect, getSingleTransaction);
 
+// GET /api/transactions/:creatorId/summary
+// Aggregated stats for a creator — total tips, total amount, breakdown by method
+// MUST be before /:creatorId to avoid "summary" being treated as :creatorId
+router.get('/:creatorId/summary', protect, getTransactionSummary);
+
 // GET /api/transactions/:creatorId
-// Returns all transactions for a creator, newest first
-// Supports ?limit and ?method query filters
+// Full transaction history — paginated, filterable by payment method
 router.get('/:creatorId', protect, getCreatorTransactions);
 
 module.exports = router;

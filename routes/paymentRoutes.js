@@ -1,32 +1,20 @@
 /**
  * routes/paymentRoutes.js
  *
- * Payment collection routes — powered by Payaza.
+ * Payment-related routes — powered by Payaza.
  *
  * Base path: /api/payments  (registered in app.js)
  *
- * Routes:
- *   POST /api/payments/tip                  → Initiate a tip (returns checkout params or charges card)
- *   POST /api/payments/verify/:txRef        → Verify + credit after checkout completes
- *   POST /api/payments/card-callback        → Payaza POSTs card result here after 3DS
- *   POST /api/payments/webhook              → All Payaza event notifications
+ * Public routes (no auth required):
+ *   GET  /api/payments/banks              → List of Nigerian banks + codes
+ *   POST /api/payments/tip                → Initiate a tip (checkout params or card charge)
+ *   POST /api/payments/verify/:txRef      → Verify + credit after payment completes
+ *   POST /api/payments/card-callback      → Payaza POSTs card result here after 3DS
+ *   POST /api/payments/webhook            → All Payaza event notifications (HMAC-SHA512)
  *
- * Auth:
- *   All collection routes are PUBLIC — fans don't need accounts to tip.
- *   The webhook is verified via HMAC-SHA256 signature.
- *   The card-callback is called by Payaza's servers (no user auth).
- *
- * Payaza Web Checkout flow:
- *   1. Frontend calls POST /tip → gets { transactionReference, checkoutParams }
- *   2. Frontend calls PayazaCheckout.setup(checkoutParams) to open the modal
- *   3. Fan completes payment → Payaza fires webhook → creator credited
- *   4. Frontend calls POST /verify/:txRef to get confirmation + new balance
- *
- * Direct card flow:
- *   1. Frontend calls POST /tip with paymentMethod:'card' + card details
- *   2. If { status:'3ds' } returned → frontend renders threeDsHtml
- *   3. After 3DS → Payaza POSTs to /card-callback → creator credited
- *   4. Frontend polls POST /verify/:txRef for confirmation
+ * Protected routes (login required):
+ *   GET  /api/payments/enquire            → Resolve account number to account name
+ *                                           ?accountNumber=0123456789&bankCode=044
  */
 
 const express = require('express');
@@ -39,6 +27,21 @@ const {
   handleWebhook,
 } = require('../controllers/paymentController');
 
+const {
+  getBankList,
+  accountNameEnquiry,
+} = require('../controllers/paymentHelperController');
+
+const { protect } = require('../middlewares/authMiddleware');
+
+// ── Public ────────────────────────────────────────────────────────────────────
+
+// GET /api/payments/banks
+// Returns list of Nigerian banks + bank codes for the "Add bank account" screen.
+// Public — frontend needs this before a creator even signs in.
+// Cached in memory for 24 hours.
+router.get('/banks', getBankList);
+
 // POST /api/payments/tip
 // Initiates a tip. Returns Payaza checkout params or charges card directly.
 router.post('/tip', processTip);
@@ -49,12 +52,19 @@ router.post('/verify/:txRef', verifyPayment);
 
 // POST /api/payments/card-callback
 // Payaza POSTs the final card payment result here after 3DS authentication.
-// Received at the callback_url we pass in the card charge request.
 router.post('/card-callback', handleCardCallback);
 
 // POST /api/payments/webhook
-// Payaza event notifications — charge completions, transfer results.
-// Verified via HMAC-SHA256 signature in the x-payaza-signature header.
+// All Payaza event notifications — verified via HMAC-SHA512 in x-payaza-signature.
+// app.js registers express.raw() on this path before express.json() so the
+// raw body Buffer is available for signature verification.
 router.post('/webhook', handleWebhook);
+
+// ── Protected ─────────────────────────────────────────────────────────────────
+
+// GET /api/payments/enquire?accountNumber=0123456789&bankCode=044
+// Resolves a bank account number + code to the account holder name.
+// Creator calls this before saving their bank account to confirm it's correct.
+router.get('/enquire', protect, accountNameEnquiry);
 
 module.exports = router;

@@ -55,6 +55,7 @@ const { payaza, verifyWebhookSignature } = require('../config/payaza');
 const { PayazaError } = require('payaza-node-sdk');
 const { db } = require('../config/firebase');
 const { validateTip } = require('../utils/validation');
+const { sendTipNotification } = require('../services/emailService');
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Internal helper — credit creator wallet + log transaction (idempotent)
@@ -130,6 +131,25 @@ const creditCreatorWallet = async (
   });
 
   console.log(`[Credit] ₦${amount} credited to creator ${creatorId} (ref: ${payazaRef})`);
+
+  // ── Email notification ────────────────────────────────────────────────────
+  // Fetch creator details and send a tip received notification.
+  // Fire-and-forget — don't await, email failure must never block crediting.
+  try {
+    const creatorDoc = await db.collection('creators').doc(creatorId).get();
+    if (creatorDoc.exists) {
+      const creator = creatorDoc.data();
+      sendTipNotification({
+        to:            creator.email,
+        creatorName:   creator.name,
+        amount,
+        fanName:       fanDetails.fanName || 'Anonymous',
+        paymentMethod,
+        newBalance:    creator.walletBalance + amount,
+      }).catch((err) => console.error('[Credit] Tip email failed:', err.message));
+    }
+  } catch (_) { /* non-fatal */ }
+
   return true;
 };
 

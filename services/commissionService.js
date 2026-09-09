@@ -3,48 +3,117 @@
  *
  * Manages commission/fee configuration for KudiClap transactions.
  *
- * Commission rates are stored in a Firestore "commissions" collection
- * so they can be updated from the admin dashboard without redeploying code.
+ * Rates live in the Firestore "commissions" collection so they can be updated
+ * from the admin dashboard without a code deploy. Each document is keyed by
+ * transactionType (e.g. "withdraw", "deposit", "payment").
  *
- * ── Commission collection structure ───────────────────────────────────────────
+ * ── Default rates (seeded on server start) ────────────────────────────────────
  *
- *   Collection: commissions
- *   Document ID: the transactionType (e.g. "withdraw", "deposit", "payment")
+ *   withdraw : 0% + ₦0 flat  → free payouts (KudiClap's zero-fee promise)
+ *   deposit  : 0% + ₦0 flat  → Payaza charges their own fee externally
+ *   payment  : 0% + ₦0 flat  → tipping is zero-fee for fans
  *
- *   Fields:
- *     transactionType  String  — "withdraw" | "deposit" | "payment"
- *     flatAmount       Number  — Fixed fee in Naira (₦) added on top of the amount
- *     percentage       Number  — Percentage of the amount (0–100), applied before flat fee
- *     isActive         Boolean — Whether this commission rule is active
- *     description      String  — Human-readable description for the admin dashboard
- *     updatedAt        Date    — When this rule was last changed
+ * ── Seeding logic ─────────────────────────────────────────────────────────────
  *
- *   Example (withdraw): flatAmount=0, percentage=1.5
- *     → A ₦10,000 withdrawal deducts ₦150 in commission
+ *   seedDefaultCommissions() is called once when the server starts.
+ *   It uses { merge: true } so it NEVER overwrites rates that have already
+ *   been configured by an admin — it only writes if the document is missing.
  *
- * ── Default commission rates ───────────────────────────────────────────────────
- *
- *   withdraw: 0% flat, 0 flat fee (free for now — can be enabled later)
- *   deposit:  0% (collections via Payaza — Payaza charges their own fee)
- *   payment:  0% (tips are zero-fee — core KudiClap value proposition)
- *
- * Exported functions:
- *   - getCommission(transactionType) → returns { flatAmount, percentage }
- *   - calculateCommission(amount, transactionType) → returns { commission, totalDeduction }
- *   - setCommission(transactionType, data) → admin: creates/updates a commission rule
+ * Exported:
+ *   - getCommission(type)              → { flatAmount, percentage, isActive }
+ *   - calculateCommission(amount,type) → { commission, totalDeduction, breakdown }
+ *   - setCommission(type, data)        → upsert a commission rule (admin)
+ *   - seedDefaultCommissions()         → idempotent seed on startup
  */
 
 const { db } = require('../config/firebase');
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Default commission definitions
+// ─────────────────────────────────────────────────────────────────────────────
+
+const DEFAULT_COMMISSIONS = [
+  {
+    transactionType: 'withdraw',
+    flatAmount: 0,
+    percentage: 0,
+    isActive: false,   // inactive = zero fees; admin can flip to true when ready
+    description: 'Fee on creator withdrawals. Zero by default per KudiClap promise.',
+  },
+  {
+    transactionType: 'deposit',
+    flatAmount: 0,
+    percentage: 0,
+    isActive: false,
+    description: 'Fee on fan tips/deposits. Zero — Payaza charges its own gateway fee.',
+  },
+  {
+    transactionType: 'payment',
+    flatAmount: 0,
+    percentage: 0,
+    isActive: false,
+    description: 'General payment commission. Zero by default.',
+  },
+];
+
+// ─────────────────────────────────────────────────────────────────────────────
+// seedDefaultCommissions
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Seeds default commission documents into Firestore on server start.
+ *
+ * Safe to call every time the server boots:
+ *   - Uses { merge: false } via set() only when the document does NOT exist.
+ *   - Checks existence first — never overwrites admin-configured rates.
+ *   - Runs all checks in parallel for fast startup.
+ *
+ * Called from server.js after the HTTP server starts listening.
+ */
+const seedDefaultCommissions = async () => {
+  try {
+    const batch = db.batch();
+    let seededCount = 0;
+
+    // Check all three types in parallel
+    const checks = await Promise.all(
+      DEFAULT_COMMISSIONS.map((comm) =>
+        db.collection('commissions').doc(comm.transactionType).get()
+      )
+    );
+
+    checks.forEach((docSnap, i) => {
+      if (!docSnap.exists) {
+        // Document doesn't exist yet — seed it
+        const comm = DEFAULT_COMMISSIONS[i];
+        batch.set(db.collection('commissions').doc(comm.transactionType), {
+          ...comm,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        });
+        seededCount++;
+      }
+    });
+
+    if (seededCount > 0) {
+      await batch.commit();
+      console.log(`[Commission] Seeded ${seededCount} default commission rule(s).`);
+    } else {
+      console.log('[Commission] Commission rules already exist — skipping seed.');
+    }
+  } catch (err) {
+    // Non-fatal — log and continue. Missing commission docs fall back to 0%.
+    console.error('[Commission] Seed failed (non-fatal):', err.message);
+  }
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // getCommission
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Fetches the commission configuration for a given transaction type.
- *
- * Returns the stored Firestore document, or safe defaults if no document
- * exists (0 commission) — so the app never breaks if the collection is empty.
+ * Fetches the commission config for a given transaction type.
+ * Falls back to zero fees if the document doesn't exist or Firestore is down.
  *
  * @param {string} transactionType - 'withdraw' | 'deposit' | 'payment'
  * @returns {Promise<{flatAmount: number, percentage: number, isActive: boolean}>}
@@ -54,19 +123,18 @@ const getCommission = async (transactionType) => {
     const doc = await db.collection('commissions').doc(transactionType).get();
 
     if (!doc.exists) {
-      // No commission configured for this type — default to zero fees
       return { flatAmount: 0, percentage: 0, isActive: false };
     }
 
     const data = doc.data();
     return {
-      flatAmount: data.flatAmount || 0,
-      percentage: data.percentage || 0,
-      isActive: data.isActive !== false, // Default to active if field is missing
+      flatAmount:  data.flatAmount  ?? 0,
+      percentage:  data.percentage  ?? 0,
+      isActive:    data.isActive    ?? false,
+      description: data.description || '',
     };
   } catch (err) {
-    // If Firestore is unreachable, fall back to zero fees rather than blocking the transaction
-    console.error('[Commission] Could not fetch commission for', transactionType, ':', err.message);
+    console.error('[Commission] getCommission failed for', transactionType, ':', err.message);
     return { flatAmount: 0, percentage: 0, isActive: false };
   }
 };
@@ -76,36 +144,31 @@ const getCommission = async (transactionType) => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Calculates the commission fee for a given transaction amount and type.
+ * Calculates the fee for a given amount and transaction type.
  *
- * Commission formula:
- *   percentageFee = amount × (percentage / 100)
- *   totalCommission = percentageFee + flatAmount
+ * Formula:
+ *   percentageFee  = amount × (percentage / 100)
+ *   commission     = percentageFee + flatAmount
+ *   totalDeduction = amount + commission
  *
- * Example: amount=₦10,000, percentage=1.5, flatAmount=50
- *   percentageFee = 10000 × 0.015 = 150
- *   totalCommission = 150 + 50 = 200
- *   totalDeduction = 10000 + 200 = 10200
- *
- * @param {number} amount          - Transaction amount in Naira
- * @param {string} transactionType - 'withdraw' | 'deposit' | 'payment'
- * @returns {Promise<{commission: number, totalDeduction: number, breakdown: object}>}
+ * @param {number} amount           - Transaction amount in Naira
+ * @param {string} transactionType  - 'withdraw' | 'deposit' | 'payment'
+ * @returns {Promise<{commission, totalDeduction, breakdown}>}
  */
 const calculateCommission = async (amount, transactionType) => {
   const { flatAmount, percentage, isActive } = await getCommission(transactionType);
 
-  // If commission is inactive or zero, return clean zeros
   if (!isActive || (flatAmount === 0 && percentage === 0)) {
     return {
-      commission: 0,
+      commission:     0,
       totalDeduction: amount,
       breakdown: { flatAmount: 0, percentageFee: 0, percentage: 0 },
     };
   }
 
-  const percentageFee = parseFloat((amount * (percentage / 100)).toFixed(2));
-  const commission = parseFloat((percentageFee + flatAmount).toFixed(2));
-  const totalDeduction = parseFloat((amount + commission).toFixed(2));
+  const percentageFee    = parseFloat((amount * (percentage / 100)).toFixed(2));
+  const commission       = parseFloat((percentageFee + flatAmount).toFixed(2));
+  const totalDeduction   = parseFloat((amount + commission).toFixed(2));
 
   return {
     commission,
@@ -115,14 +178,12 @@ const calculateCommission = async (amount, transactionType) => {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// setCommission (admin use)
+// setCommission
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
  * Creates or updates a commission rule in Firestore.
- *
- * This is called by the admin panel (not yet built) to adjust commission rates
- * without code changes or redeployments.
+ * Called by adminController — not exposed to creators.
  *
  * @param {string} transactionType - 'withdraw' | 'deposit' | 'payment'
  * @param {object} data            - { flatAmount, percentage, isActive, description }
@@ -131,14 +192,19 @@ const setCommission = async (transactionType, data) => {
   await db.collection('commissions').doc(transactionType).set(
     {
       transactionType,
-      flatAmount: data.flatAmount ?? 0,
-      percentage: data.percentage ?? 0,
-      isActive: data.isActive ?? true,
+      flatAmount:  data.flatAmount  ?? 0,
+      percentage:  data.percentage  ?? 0,
+      isActive:    data.isActive    ?? true,
       description: data.description || '',
-      updatedAt: new Date(),
+      updatedAt:   new Date(),
     },
-    { merge: true } // merge: true means we only update the fields we send
+    { merge: true }
   );
 };
 
-module.exports = { getCommission, calculateCommission, setCommission };
+module.exports = {
+  getCommission,
+  calculateCommission,
+  setCommission,
+  seedDefaultCommissions,
+};
