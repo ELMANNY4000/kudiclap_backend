@@ -201,6 +201,14 @@ const login = async (req, res, next) => {
       );
     } catch (axiosError) {
       const code = axiosError.response?.data?.error?.message;
+      // Log the exact Firebase error code for debugging
+      console.error('[Login] Firebase error code:', code, '| Full error:', JSON.stringify(axiosError.response?.data));
+
+      if (!code) {
+        // Network error or unexpected response shape — bubble up
+        throw axiosError;
+      }
+
       if (['EMAIL_NOT_FOUND', 'INVALID_PASSWORD', 'INVALID_LOGIN_CREDENTIALS'].includes(code)) {
         return res.status(401).json({ success: false, error: 'Invalid email or password.' });
       }
@@ -210,7 +218,8 @@ const login = async (req, res, next) => {
       if (code === 'TOO_MANY_ATTEMPTS_TRY_LATER') {
         return res.status(429).json({ success: false, error: 'Too many login attempts. Try again later.' });
       }
-      throw axiosError;
+      // Catch-all for any other Firebase 400 codes — return the raw message
+      return res.status(401).json({ success: false, error: `Authentication failed: ${code}` });
     }
 
     const { idToken, refreshToken, localId: uid } = firebaseResponse.data;

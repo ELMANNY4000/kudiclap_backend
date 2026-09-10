@@ -135,14 +135,23 @@ const getCreatorDashboard = async (req, res, next) => {
     }
 
     // Fetch 10 most recent transactions
-    const txSnapshot = await db
-      .collection('transactions')
-      .where('creatorId', '==', id)
-      .orderBy('timestamp', 'desc')
-      .limit(10)
-      .get();
-
-    const recentTransactions = txSnapshot.docs.map((doc) => doc.data());
+    // Requires composite index: transactions [creatorId ASC, timestamp DESC]
+    // If the index doesn't exist yet, return empty array rather than crashing.
+    let recentTransactions = [];
+    try {
+      const txSnapshot = await db
+        .collection('transactions')
+        .where('creatorId', '==', id)
+        .orderBy('timestamp', 'desc')
+        .limit(10)
+        .get();
+      recentTransactions = txSnapshot.docs.map((doc) => doc.data());
+    } catch (indexErr) {
+      // Firestore index not created yet — silently return empty transactions
+      // Create the index: Firebase Console → Firestore → Indexes
+      //   Collection: transactions | Fields: creatorId ASC, timestamp DESC
+      console.warn('[Dashboard] Missing Firestore index for transactions query:', indexErr.message.split('\n')[0]);
+    }
     const creatorData = creatorDoc.data();
 
     return res.status(200).json({
