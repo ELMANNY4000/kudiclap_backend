@@ -16,6 +16,9 @@
   ],
   "author": "Ulodo Emmanuel",
   "license": "ISC",
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "dependencies": {
     "axios": "^1.20.0",
     "bcrypt": "^6.0.0",
