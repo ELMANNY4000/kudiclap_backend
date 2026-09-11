@@ -2,9 +2,25 @@
 
 > Tip African Creators. Instantly. No Fees. No Apps.
 
-Backend API for KudiClap — a zero-fee tipping platform built for African creators. Creators get a custom link and USSD code. Fans tip via card, bank transfer, or mobile money. Creators withdraw straight to their bank account.
+Backend API for KudiClap — a zero-fee tipping platform built for African creators.
+Creators get a **custom link** (e.g. `kudiclap.com/ulodo`) and a **USSD code** (e.g. `*388*12345#`).
+Fans tip via card, bank transfer, mobile money, or USSD.
+Creators withdraw straight to their bank account.
 
 Built for **The Fusion Hack** hackathon (Sept 12–19, 2026).
+
+---
+
+## 🚀 Live API
+
+```
+https://web-production-d2a8f.up.railway.app
+```
+
+Health check:
+```
+GET https://web-production-d2a8f.up.railway.app/health
+```
 
 ---
 
@@ -17,19 +33,47 @@ Built for **The Fusion Hack** hackathon (Sept 12–19, 2026).
 | Database | Firebase Firestore |
 | Auth | Firebase Auth |
 | Payments | Payaza (card, bank transfer, mobile money) |
-| Email | Nodemailer (Gmail / SMTP) |
+| Email | Nodemailer (Gmail) |
 | Hosting | Railway |
+
+---
+
+## Core Flow — How a Tip Works
+
+```
+Fan visits kudiclap.com/ulodo
+  → GET /api/creators/u/ulodo          (load creator public profile)
+  → Fan clicks "Tip ₦500"
+  → POST /api/payments/tip             (get Payaza checkout params)
+  → Fan completes payment in Payaza modal
+  → Payaza fires POST /api/payments/webhook
+  → Backend verifies with payaza.account.getTransactionStatus()
+  → Creator wallet credited (atomic Firestore transaction)
+  → Email notification sent to creator
+```
+
+## Core Flow — How a Withdrawal Works
+
+```
+Creator on dashboard
+  → POST /api/withdrawals              (body: { creatorId, amount, pin })
+  → Backend verifies 4-digit PIN (bcrypt)
+  → Calculates commission (Firestore commissions collection)
+  → Deducts totalDeduction from wallet (atomic)
+  → Calls payaza.transfers.initiate() with creator's bank account
+  → Payaza fires POST /api/payments/webhook (transfer.success/failed)
+  → Withdrawal status updated, email sent
+  → If failed: wallet balance automatically restored
+```
 
 ---
 
 ## Prerequisites
 
-Before you set up the project, make sure you have:
-
 - **Node.js 18+** — [nodejs.org](https://nodejs.org)
-- **A Firebase project** — [console.firebase.google.com](https://console.firebase.google.com)
-- **A Payaza business account** — [business.payaza.africa](https://business.payaza.africa)
-- **A Gmail account** (for OTP emails in development)
+- **Firebase project** — [console.firebase.google.com](https://console.firebase.google.com)
+- **Payaza business account** — [business.payaza.africa](https://business.payaza.africa)
+- **Gmail account** (for OTP emails)
 
 ---
 
@@ -45,81 +89,60 @@ npm install
 
 ### 2. Configure environment variables
 
-Copy the `.env` file and fill in your values:
+Create a `.env` file in the root and fill in:
 
-```bash
-# The .env file is already in the repo (it is in .gitignore — never commit it)
-# Open it and fill in the keys below
+```env
+# Server
+PORT=3000
+NODE_ENV=development
+BACKEND_URL=http://localhost:3000
+FRONTEND_URL=http://localhost:3001
+ALLOWED_ORIGIN=http://localhost:3001
+
+# Payaza — business.payaza.africa → Settings → Developers
+PAYAZA_PUBLIC_KEY=your_payaza_public_key
+PAYAZA_SECRET_KEY=your_payaza_secret_key
+PAYAZA_ENV=test
+PAYAZA_TRANSACTION_PIN=your_6_digit_pin
+PAYAZA_WEBHOOK_SECRET=your_webhook_secret
+
+# Firebase — Firebase Console → Project Settings → Service Accounts
+FIREBASE_PROJECT_ID=your_project_id
+FIREBASE_CLIENT_EMAIL=your_client_email
+FIREBASE_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
+FIREBASE_WEB_API_KEY=your_web_api_key
+
+# Email — Gmail App Password
+EMAIL_HOST=smtp.gmail.com
+EMAIL_PORT=587
+EMAIL_SECURE=false
+EMAIL_USER=your@gmail.com
+EMAIL_PASS=your_app_password
+EMAIL_FROM="KudiClap <noreply@kudiclap.com>"
+
+# Dev only — returns OTP in API response for testing
+RETURN_OTP_IN_RESPONSE=true
+
+# Admin
+ADMIN_EMAILS=your@gmail.com
+KUDICLAP_PHONE=08000000000
 ```
 
-| Variable | Where to get it | Required |
-|----------|----------------|----------|
-| `PORT` | Leave as `3000` | ✅ |
-| `NODE_ENV` | `development` locally, `production` on Railway | ✅ |
-| `BACKEND_URL` | `http://localhost:3000` locally | ✅ |
-| `FRONTEND_URL` | `http://localhost:3001` locally | ✅ |
-| `ALLOWED_ORIGIN` | `http://localhost:3001` locally | ✅ |
-| `PAYAZA_PUBLIC_KEY` | Payaza dashboard → Settings → Developers → API Keys | ✅ |
-| `PAYAZA_ENV` | `test` for sandbox, `live` for production | ✅ |
-| `PAYAZA_TRANSACTION_PIN` | Payaza dashboard → Settings → Security → set 6-digit PIN | ✅ |
-| `PAYAZA_WEBHOOK_SECRET` | Payaza dashboard → Settings → Developers → Webhooks | ✅ |
-| `FIREBASE_PROJECT_ID` | Firebase Console → Project Settings → General | ✅ |
-| `FIREBASE_CLIENT_EMAIL` | Firebase Console → Project Settings → Service Accounts → Generate key | ✅ |
-| `FIREBASE_PRIVATE_KEY` | Same JSON file as above — copy the `private_key` field | ✅ |
-| `FIREBASE_WEB_API_KEY` | Firebase Console → Project Settings → General → Web API Key | ✅ |
-| `EMAIL_HOST` | `smtp.gmail.com` for Gmail | ✅ |
-| `EMAIL_PORT` | `587` | ✅ |
-| `EMAIL_SECURE` | `false` for port 587 | ✅ |
-| `EMAIL_USER` | Your Gmail address | ✅ |
-| `EMAIL_PASS` | Gmail App Password (not your real password) | ✅ |
-| `EMAIL_FROM` | `"KudiClap <noreply@kudiclap.com>"` | ✅ |
-| `RETURN_OTP_IN_RESPONSE` | `true` in dev (returns OTP in API response for testing) | dev only |
-| `ADMIN_EMAILS` | Your email — comma-separated for multiple admins | ✅ |
-| `KUDICLAP_PHONE` | Your registered Nigerian business phone number | ✅ |
-
-#### Getting Firebase credentials
-
-1. Go to [Firebase Console](https://console.firebase.google.com) → your project
-2. Click the gear icon → **Project Settings**
-3. Go to **Service Accounts** tab → click **Generate new private key**
-4. Download the JSON file — copy the values into `.env`:
-   - `project_id` → `FIREBASE_PROJECT_ID`
-   - `client_email` → `FIREBASE_CLIENT_EMAIL`
-   - `private_key` → `FIREBASE_PRIVATE_KEY` (paste the full string including `\n` characters, wrapped in double quotes)
-5. Go to **General** tab → scroll to **Your apps** → copy the **Web API Key** → `FIREBASE_WEB_API_KEY`
-
-#### Setting up Gmail App Password
-
-1. Enable 2-Factor Authentication on your Google account
-2. Go to [myaccount.google.com](https://myaccount.google.com) → **Security** → **App Passwords**
-3. Generate a password for **Mail**
-4. Paste the 16-character password as `EMAIL_PASS`
-
-### 3. Set up Firebase
-
-In your Firebase project:
-
-1. Go to **Firestore Database** → **Create database** → choose **Start in test mode**
-2. Go to **Authentication** → **Sign-in method** → enable **Email/Password**
-3. Create the required **composite indexes** (see section below)
-
-### 4. Start the development server
+### 3. Start the server
 
 ```bash
 npm run dev
 ```
 
-The server starts on `http://localhost:3000`. Visit `http://localhost:3000/health` to confirm it's running.
+Server starts on `http://localhost:3000`. Visit `http://localhost:3000/health` to confirm.
 
-On first start, the server automatically seeds default commission rules (0% on all transaction types) into Firestore.
+On first start, the server automatically seeds default commission rules into Firestore.
 
 ---
 
 ## Firestore Composite Indexes
 
-Firestore requires composite indexes for queries that combine multiple fields. Create these in **Firebase Console → Firestore → Indexes → Composite**.
-
-Alternatively, add a `firestore.indexes.json` file and run `firebase deploy --only firestore:indexes`.
+Create these in **Firebase Console → Firestore → Indexes → Composite**:
 
 | Collection | Fields | Order |
 |-----------|--------|-------|
@@ -130,22 +153,22 @@ Alternatively, add a `firestore.indexes.json` file and run `firebase deploy --on
 | `otps` | `email` ▲, `purpose` ▲, `used` ▲ | ASC, ASC, ASC |
 | `otps` | `email` ▲, `purpose` ▲, `used` ▲, `createdAt` ▼ | ASC, ASC, ASC, DESC |
 
-> **Tip:** If you skip this step, Firestore will throw an error the first time each query runs and include a direct link to auto-create the missing index. Click the link.
+> Firestore will throw an error with a direct auto-create link the first time each query runs — click the link to create the index instantly.
 
 ---
 
 ## API Reference
 
-Base URL: `http://localhost:3000` (dev) · `https://your-app.railway.app` (production)
+**Base URL:** `https://web-production-d2a8f.up.railway.app`
 
 ### Auth — `/api/auth`
 
 | Method | Endpoint | Auth | Description |
 |--------|----------|------|-------------|
-| POST | `/api/auth/signup` | Public | Create creator account |
+| POST | `/api/auth/signup` | Public | Create creator account → returns `customLink`, `ussdCode`, `customToken` |
 | POST | `/api/auth/login` | Public | Login → returns `idToken` + `refreshToken` |
-| POST | `/api/auth/logout` | 🔒 | Revoke all sessions |
-| GET | `/api/auth/me` | 🔒 | Get current creator profile |
+| POST | `/api/auth/logout` | 🔒 | Revoke all sessions server-side |
+| GET | `/api/auth/me` | 🔒 | Get current creator profile + `customLink` |
 | POST | `/api/auth/change-password` | 🔒 | Change login password |
 | POST | `/api/auth/set-pin` | 🔒 | Set 4-digit withdrawal PIN (first time) |
 | POST | `/api/auth/change-pin` | 🔒 | Update existing withdrawal PIN |
@@ -157,9 +180,9 @@ Base URL: `http://localhost:3000` (dev) · `https://your-app.railway.app` (produ
 
 | Method | Endpoint | Auth | Description |
 |--------|----------|------|-------------|
-| GET | `/api/creators/u/:username` | Public | Fan tip page by username |
+| GET | `/api/creators/u/:username` | Public | **Fan tip page** — returns `customLink`, `ussdCode`, public profile |
 | GET | `/api/creators/:id` | Public | Public profile by Firestore ID |
-| GET | `/api/creators/dashboard/:id` | 🔒 | Private dashboard + wallet + recent tips |
+| GET | `/api/creators/dashboard/:id` | 🔒 | Private dashboard — wallet, bank, recent tips |
 | PUT | `/api/creators/:id` | 🔒 | Update name, bio, profile picture |
 | PUT | `/api/creators/:id/bank` | 🔒 | Save bank account for withdrawals |
 
@@ -169,16 +192,16 @@ Base URL: `http://localhost:3000` (dev) · `https://your-app.railway.app` (produ
 |--------|----------|------|-------------|
 | GET | `/api/payments/banks` | Public | List Nigerian banks + codes |
 | GET | `/api/payments/enquire` | 🔒 | Resolve account number to account name |
-| POST | `/api/payments/tip` | Public | Initiate a fan tip |
-| POST | `/api/payments/verify/:txRef` | Public | Verify payment + credit creator |
+| POST | `/api/payments/tip` | Public | **Initiate a fan tip** (returns Payaza checkout params) |
+| POST | `/api/payments/verify/:txRef` | Public | Verify payment + credit creator wallet |
 | POST | `/api/payments/card-callback` | Public | Payaza card 3DS result callback |
-| POST | `/api/payments/webhook` | Public | Payaza webhook notifications |
+| POST | `/api/payments/webhook` | Public | Payaza webhook (HMAC-SHA512 verified) |
 
 ### USSD — `/api/ussd`
 
 | Method | Endpoint | Auth | Description |
 |--------|----------|------|-------------|
-| POST | `/api/ussd/tip` | Public | Fan tips via USSD shortcode |
+| POST | `/api/ussd/tip` | Public | Fan tips via USSD shortcode (e.g. `*388*12345#`) |
 | POST | `/api/ussd/withdraw/initiate` | 🔒 | Creator initiates USSD withdrawal (PIN required) |
 | POST | `/api/ussd/withdraw/verify` | 🔒 | Confirm USSD withdrawal with code |
 | POST | `/api/ussd/withdraw/cancel` | 🔒 | Cancel pending USSD withdrawal |
@@ -187,7 +210,7 @@ Base URL: `http://localhost:3000` (dev) · `https://your-app.railway.app` (produ
 
 | Method | Endpoint | Auth | Description |
 |--------|----------|------|-------------|
-| POST | `/api/withdrawals` | 🔒 | Request a bank transfer payout (PIN required) |
+| POST | `/api/withdrawals` | 🔒 | Request bank transfer payout (PIN required) |
 | GET | `/api/withdrawals/:creatorId` | 🔒 | Withdrawal history |
 | GET | `/api/withdrawals/status/:withdrawalId` | 🔒 | Status of a specific withdrawal |
 
@@ -195,8 +218,8 @@ Base URL: `http://localhost:3000` (dev) · `https://your-app.railway.app` (produ
 
 | Method | Endpoint | Auth | Description |
 |--------|----------|------|-------------|
-| GET | `/api/transactions/:creatorId` | 🔒 | Tip history (paginated, filterable) |
-| GET | `/api/transactions/:creatorId/summary` | 🔒 | Aggregated stats (total, by method) |
+| GET | `/api/transactions/:creatorId` | 🔒 | Tip history (paginated, filterable by method) |
+| GET | `/api/transactions/:creatorId/summary` | 🔒 | Aggregated stats (total, average, by method) |
 | GET | `/api/transactions/single/:id` | 🔒 | Single transaction by ID |
 
 ### Admin — `/api/admin`
@@ -213,41 +236,10 @@ Base URL: `http://localhost:3000` (dev) · `https://your-app.railway.app` (produ
 
 ---
 
-## Core Flow — How a Tip Works
-
-```
-Fan visits kudiclap.com/ulodo
-  → GET /api/creators/u/ulodo          (load creator profile)
-  → POST /api/payments/tip             (get Payaza checkout params)
-  → Fan completes payment in Payaza modal
-  → Payaza fires POST /api/payments/webhook
-  → Backend verifies with payaza.account.getTransactionStatus()
-  → Creator wallet credited (atomic Firestore transaction)
-  → Email notification sent to creator
-```
-
-## Core Flow — How a Withdrawal Works
-
-```
-Creator on dashboard
-  → POST /api/withdrawals              (body: { creatorId, amount, pin })
-  → Backend verifies PIN (bcrypt)
-  → Calculates commission (Firestore commissions collection)
-  → Deducts totalDeduction from wallet (atomic)
-  → Calls payaza.transfers.initiate() with creator's bank account
-  → Payaza fires POST /api/payments/webhook (transfer.success/failed)
-  → Withdrawal status updated, email sent
-  → If failed: wallet balance automatically restored
-```
-
----
-
 ## Postman Testing — Core Loop
 
-Import and run these requests in order:
-
 ### Step 1 — Sign up
-```
+```json
 POST /api/auth/signup
 {
   "name": "Test Creator",
@@ -257,31 +249,27 @@ POST /api/auth/signup
   "mobileMoneyNumber": "08012345678"
 }
 ```
-→ Copy the `uid` and `customToken` from the response.
+Response includes `customLink: "kudiclap.com/testcreator"` and `ussdCode`.
 
 ### Step 2 — Login
-```
+```json
 POST /api/auth/login
 {
   "email": "test@example.com",
   "password": "Test1234"
 }
 ```
-→ Copy the `idToken`. Use this as `Authorization: Bearer <idToken>` on all protected requests.
+Copy the `idToken` — use as `Authorization: Bearer <idToken>` on all protected requests.
 
 ### Step 3 — Set withdrawal PIN
-```
+```json
 POST /api/auth/set-pin
-Authorization: Bearer <idToken>
-{
-  "pin": "1234"
-}
+{ "pin": "1234" }
 ```
 
 ### Step 4 — Add bank account
-```
-PUT /api/creators/<uid>/bank
-Authorization: Bearer <idToken>
+```json
+PUT /api/creators/:id/bank
 {
   "bankAccountNumber": "0123456789",
   "bankCode": "044",
@@ -290,14 +278,14 @@ Authorization: Bearer <idToken>
 }
 ```
 
-### Step 5 — Get the public tip page
+### Step 5 — View fan tip page
 ```
 GET /api/creators/u/testcreator
 ```
-→ Should return the creator's public profile including their USSD code.
+Returns public profile with `customLink`, `ussdCode`, `totalEarnings`.
 
-### Step 6 — Initiate a tip (Payaza checkout)
-```
+### Step 6 — Initiate a tip
+```json
 POST /api/payments/tip
 {
   "creatorId": "<uid>",
@@ -307,86 +295,58 @@ POST /api/payments/tip
   "fanEmail": "fan@example.com"
 }
 ```
-→ Returns `checkoutParams`. Use these with the Payaza Checkout SDK on the frontend.  
-→ In test mode, use Payaza's sandbox to simulate a successful payment.
+Returns `checkoutParams` — pass to Payaza Checkout SDK on frontend.
 
-### Step 7 — Verify the payment manually (if webhook not set up yet)
+### Step 7 — Check dashboard
 ```
-POST /api/payments/verify/<txRef>
+GET /api/creators/dashboard/:id
 ```
-→ Should credit the creator's wallet and return success.
+Shows `walletBalance`, `totalEarnings`, `recentTransactions`, `customLink`.
 
-### Step 8 — Check the dashboard
-```
-GET /api/creators/dashboard/<uid>
-Authorization: Bearer <idToken>
-```
-→ Should show updated `walletBalance` and the tip in `recentTransactions`.
-
-### Step 9 — Request a withdrawal
-```
+### Step 8 — Request a withdrawal
+```json
 POST /api/withdrawals
-Authorization: Bearer <idToken>
 {
   "creatorId": "<uid>",
   "amount": 500,
   "pin": "1234"
 }
 ```
-→ Should deduct the wallet and initiate a Payaza transfer.
-
-### Step 10 — Check withdrawal status
-```
-GET /api/withdrawals/status/<withdrawalId>
-Authorization: Bearer <idToken>
-```
 
 ---
 
 ## Deployment to Railway
 
-### 1. Push your code to GitHub
-
+### 1. Push to GitHub
 ```bash
 git push origin main
 ```
 
-### 2. Create a Railway project
-
-1. Go to [railway.app](https://railway.app) → **New Project** → **Deploy from GitHub repo**
+### 2. Railway setup
+1. Go to [railway.app](https://railway.app) → **New Project** → **Deploy from GitHub**
 2. Select `ELMANNY4000/kudiclap_backend`
-3. Railway auto-detects Node.js and runs `npm start`
+3. Go to **Variables** tab → **Raw Editor** → paste all env vars
+4. Railway auto-deploys on every push to `main`
 
-### 3. Set environment variables on Railway
-
-Go to your Railway project → **Variables** tab → add every key from your `.env` file.
-
-> **Important:** Do NOT commit your `.env` file. Set all secrets as Railway environment variables.
-
-### 4. Configure Payaza webhook
-
-Once Railway gives you a live URL (e.g. `https://kudiclap-backend.up.railway.app`):
-
-1. Go to Payaza dashboard → **Settings → Developers → Webhooks**
-2. Add webhook URL: `https://your-app.up.railway.app/api/payments/webhook`
-3. Copy the generated **Secret Hash** → paste as `PAYAZA_WEBHOOK_SECRET` in Railway variables
-
-### 5. Update Railway environment variables
-
+### 3. Environment variables on Railway
+Set all variables from your `.env` file. Key ones for production:
 ```
-BACKEND_URL=https://your-app.up.railway.app
-FRONTEND_URL=https://your-frontend.vercel.app
-ALLOWED_ORIGIN=https://your-frontend.vercel.app
 NODE_ENV=production
-PAYAZA_ENV=live   (only when you're ready to go live with real money)
+BACKEND_URL=https://your-app.up.railway.app
+PAYAZA_ENV=live  (only when going live with real money)
+RETURN_OTP_IN_RESPONSE=false
 ```
 
-### 6. Verify deployment
+### 4. After deploy — add webhook URL in Payaza
+```
+https://your-app.up.railway.app/api/payments/webhook
+```
 
+### 5. Verify
 ```
 GET https://your-app.up.railway.app/health
+→ { "status": "ok", "message": "KudiClap backend is running." }
 ```
-Should return: `{ "status": "ok", "message": "KudiClap backend is running." }`
 
 ---
 
@@ -395,18 +355,18 @@ Should return: `{ "status": "ok", "message": "KudiClap backend is running." }`
 ```
 kudiclap_backend/
 ├── config/
-│   ├── firebase.js          # Firebase Admin SDK singleton
-│   └── payaza.js            # Payaza SDK client singleton
+│   ├── firebase.js              # Firebase Admin SDK
+│   └── payaza.js                # Payaza SDK client
 ├── controllers/
-│   ├── authController.js    # signup, login, logout, PIN, password
-│   ├── creatorController.js # profiles, dashboard, bank account
-│   ├── paymentController.js # tips, webhook, card callback, verification
+│   ├── authController.js        # signup, login, PIN, password, logout
+│   ├── creatorController.js     # profiles, dashboard, bank account
+│   ├── paymentController.js     # tips, webhook, card callback
 │   ├── paymentHelperController.js # bank list, account name enquiry
-│   ├── ussdController.js    # USSD tip + USSD withdrawal flow
-│   ├── withdrawalController.js    # Payaza bank transfer payouts
-│   ├── transactionController.js   # tip history, summary, pagination
-│   ├── otpController.js     # OTP request, verify, PIN reset
-│   └── adminController.js   # commission management, platform stats
+│   ├── ussdController.js        # USSD tip + USSD withdrawal
+│   ├── withdrawalController.js  # Payaza bank transfer payouts
+│   ├── transactionController.js # tip history, summary, pagination
+│   ├── otpController.js         # OTP request, verify, PIN reset
+│   └── adminController.js       # commission management, platform stats
 ├── routes/
 │   ├── authRoutes.js
 │   ├── creatorRoutes.js
@@ -416,18 +376,49 @@ kudiclap_backend/
 │   ├── transactionRoutes.js
 │   └── adminRoutes.js
 ├── services/
-│   ├── emailService.js      # nodemailer OTP + notification emails
-│   └── commissionService.js # fee calculation + Firestore seeding
+│   ├── emailService.js          # Nodemailer — OTP + tip + withdrawal emails
+│   └── commissionService.js     # Fee calculation + Firestore seeding
 ├── middlewares/
-│   ├── authMiddleware.js    # Firebase token verification
-│   └── errorMiddleware.js   # global error handler
+│   ├── authMiddleware.js        # Firebase token verification + isSameUser
+│   └── errorMiddleware.js       # Global error handler
 ├── utils/
-│   ├── validation.js        # all Joi schemas
-│   └── generateUssdCode.js  # *388*XXXXX# code generator
-├── app.js                   # Express setup, routes, middleware
-├── server.js                # HTTP server entry point
-└── .env                     # environment variables (never commit)
+│   ├── validation.js            # All Joi schemas (17 schemas)
+│   └── generateUssdCode.js      # *388*XXXXX# generator
+├── firestore.rules              # Firestore security rules
+├── firestore.indexes.json       # All 6 composite index definitions
+├── firebase.json                # Firebase CLI config
+├── Procfile                     # Railway start command
+├── app.js                       # Express setup + all routes
+└── server.js                    # HTTP server entry point + commission seed
 ```
+
+---
+
+## Firestore Collections
+
+| Collection | Purpose |
+|-----------|---------|
+| `creators` | Creator profiles + wallet balances |
+| `transactions` | All confirmed tip records |
+| `withdrawals` | Payout requests + status |
+| `pendingPayments` | Pre-credit payment intents (30-min expiry) |
+| `commissions` | Platform fee configuration |
+| `otps` | OTP codes (bcrypt-hashed, 10-min expiry) |
+| `otpVerifications` | Post-OTP tokens for PIN reset (5-min expiry) |
+| `ussdWithdrawals` | Pending USSD withdrawal confirmations (10-min expiry) |
+
+---
+
+## Security
+
+- **Passwords** — managed by Firebase Auth (bcrypt internally), never stored in our database
+- **Withdrawal PIN** — 4-digit PIN stored as bcrypt hash in Firestore
+- **OTP codes** — generated with `crypto.randomBytes()` (CSPRNG), stored as bcrypt hash
+- **USSD confirmation codes** — generated with `crypto.randomBytes()`, stored as bcrypt hash
+- **Webhook verification** — HMAC-SHA512 signature checked on every Payaza webhook
+- **Rate limiting** — auth: 10 req/15min, payments: 20 req/15min, general: 100 req/15min
+- **Firestore rules** — all client writes blocked; Admin SDK bypasses rules server-side
+- **Idempotent credits** — `creditCreatorWallet()` checks for duplicate `payazaRef` before writing
 
 ---
 
