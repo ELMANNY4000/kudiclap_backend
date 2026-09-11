@@ -39,7 +39,7 @@ const crypto = require('crypto');
 const { db } = require('../config/firebase');
 const { payaza } = require('../config/payaza');
 const { PayazaError } = require('payaza-node-sdk');
-const { validateUssdPayment, validateUssdWithdrawal, validateUssdVerify } = require('../utils/validation');
+const { validateUssdPayment, validateUssdWithdrawal, validateUssdVerify, validateUssdCancel } = require('../utils/validation');
 const { calculateCommission } = require('../services/commissionService');
 const { sendWithdrawalUpdate } = require('../services/emailService');
 
@@ -495,12 +495,13 @@ const verifyUssdWithdrawal = async (req, res, next) => {
  */
 const cancelUssdWithdrawal = async (req, res, next) => {
   try {
-    const { reference } = req.body;
-
-    if (!reference) {
-      return res.status(400).json({ success: false, error: 'Reference is required.' });
+    // Validate using Joi schema instead of manual presence check
+    const { error, value } = validateUssdCancel(req.body);
+    if (error) {
+      return res.status(400).json({ success: false, error: error.details[0].message });
     }
 
+    const { reference } = value;
     const uid = req.user.uid;
     const ussdDoc = await db.collection('ussdWithdrawals').doc(reference).get();
 

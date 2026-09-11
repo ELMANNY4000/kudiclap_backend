@@ -54,7 +54,7 @@
 const { payaza, verifyWebhookSignature } = require('../config/payaza');
 const { PayazaError } = require('payaza-node-sdk');
 const { db } = require('../config/firebase');
-const { validateTip } = require('../utils/validation');
+const { validateTip, validateCardCallback } = require('../utils/validation');
 const { sendTipNotification } = require('../services/emailService');
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -474,7 +474,15 @@ const verifyPayment = async (req, res, next) => {
  */
 const handleCardCallback = async (req, res, next) => {
   try {
-    const { statusOk, paymentCompleted, transaction_reference, debugMessage } = req.body;
+    // Validate the body Payaza POSTs to us
+    const { error, value } = validateCardCallback(req.body);
+    if (error) {
+      console.warn('[Card Callback] Invalid payload:', error.details[0].message);
+      // Still redirect to failed page — don't crash on malformed Payaza callback
+      return res.redirect(`${process.env.FRONTEND_URL}/tip/failed?reason=${encodeURIComponent('Invalid callback payload')}`);
+    }
+
+    const { statusOk, paymentCompleted, transaction_reference, debugMessage } = value;
 
     console.log(`[Card Callback] txRef=${transaction_reference}, statusOk=${statusOk}, paymentCompleted=${paymentCompleted}`);
 

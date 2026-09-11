@@ -473,6 +473,58 @@ const validateUssdVerify = (data) => {
   return schema.validate(data);
 };
 
+/**
+ * Validates POST /api/payments/card-callback
+ *
+ * Payaza POSTs these fields to our callback_url after a card charge completes.
+ * All fields come from Payaza — we validate they are present and the right types
+ * before processing the result.
+ *
+ * Required:
+ *   - transaction_reference → our txRef (e.g. kc-XXXXXXXX-XXXXXX)
+ *   - statusOk              → boolean — true if charge succeeded
+ *   - paymentCompleted      → boolean — true if funds were captured
+ *
+ * Optional:
+ *   - debugMessage          → failure reason from Payaza (present on failure)
+ *   - amountPaid            → actual amount charged (for cross-checking)
+ */
+const validateCardCallback = (data) => {
+  const schema = Joi.object({
+    transaction_reference: Joi.string().required().messages({
+      'string.empty': 'transaction_reference is required',
+    }),
+    statusOk: Joi.boolean().required().messages({
+      'any.required': 'statusOk is required',
+    }),
+    paymentCompleted: Joi.boolean().required().messages({
+      'any.required': 'paymentCompleted is required',
+    }),
+    debugMessage: Joi.string().allow('', null).optional(),
+    amountPaid: Joi.number().optional(),
+    // Allow any other fields Payaza may send — we only validate what we use
+  }).unknown(true);
+
+  return schema.validate(data);
+};
+
+/**
+ * Validates POST /api/ussd/withdraw/cancel
+ *
+ * Required:
+ *   - reference → the USSD withdrawal reference from initiateUssdWithdrawal
+ */
+const validateUssdCancel = (data) => {
+  const schema = Joi.object({
+    reference: Joi.string().required().messages({
+      'string.empty': 'Reference is required',
+      'any.required': 'Reference is required',
+    }),
+  });
+
+  return schema.validate(data);
+};
+
 module.exports = {
   validateCreatorSignup,
   validateLogin,
@@ -489,4 +541,6 @@ module.exports = {
   validateResetPin,
   validateUssdWithdrawal,
   validateUssdVerify,
+  validateCardCallback,
+  validateUssdCancel,
 };
