@@ -3,58 +3,57 @@
  *
  * Initializes and exports the Firebase Admin SDK connection.
  *
- * Firebase Admin SDK gives us server-side access to Firestore (our database),
- * Firebase Auth, and other Firebase services. This file reads credentials
- * from environment variables so we never hardcode secrets in the codebase.
+ * Supports two credential methods:
  *
- * Usage: const { db } = require('./config/firebase');
+ *   Method 1 — Environment variables (local dev + Railway):
+ *     FIREBASE_PROJECT_ID, FIREBASE_CLIENT_EMAIL, FIREBASE_PRIVATE_KEY
+ *     The private key uses literal \n — we replace them with real newlines.
+ *
+ *   Method 2 — Service account JSON file (fallback):
+ *     If FIREBASE_KEY_PATH is set, we load the JSON file directly.
+ *     Useful when the private key env var causes formatting issues on some hosts.
+ *
+ * Usage: const { db, admin } = require('./config/firebase');
  */
 
 const admin = require('firebase-admin');
 
-/**
- * Build the Firebase service account credential object from environment variables.
- *
- * When you generate a private key from the Firebase console it gives you a JSON
- * file — we're reading those same values from .env instead of storing the file
- * in the repo (which would be a security risk).
- *
- * The private key is stored as a string in .env with literal \n characters.
- * We replace those with real newlines so the key is formatted correctly.
- */
-const serviceAccount = {
-  type: 'service_account',
-  project_id: process.env.FIREBASE_PROJECT_ID,
-  private_key: process.env.FIREBASE_PRIVATE_KEY
-    ? process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n')
-    : undefined,
-  client_email: process.env.FIREBASE_CLIENT_EMAIL,
-};
+let credential;
 
-/**
- * Initialize the Firebase Admin app.
- *
- * admin.apps.length check prevents re-initializing on hot reloads (e.g. nodemon).
- * If the app is already initialized, we skip initialization to avoid errors.
- */
-if (!admin.apps.length) {
-  admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount),
-  });
+if (process.env.FIREBASE_KEY_PATH) {
+  // Method 2 — load from JSON file path (fallback)
+  const serviceAccount = require(process.env.FIREBASE_KEY_PATH);
+  credential = admin.credential.cert(serviceAccount);
+} else {
+  // Method 1 — load from environment variables (default)
+  // Railway and some hosts store the private key with literal \n — replace them
+  const privateKey = process.env.FIREBASE_PRIVATE_KEY
+    ? process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n')
+    : undefined;
+
+  if (!process.env.FIREBASE_PROJECT_ID || !process.env.FIREBASE_CLIENT_EMAIL || !privateKey) {
+    console.error('[Firebase] Missing required environment variables:');
+    if (!process.env.FIREBASE_PROJECT_ID) console.error('  - FIREBASE_PROJECT_ID');
+    if (!process.env.FIREBASE_CLIENT_EMAIL) console.error('  - FIREBASE_CLIENT_EMAIL');
+    if (!privateKey) console.error('  - FIREBASE_PRIVATE_KEY');
+    process.exit(1); // Crash immediately with a clear error rather than a cryptic one later
+  }
+
+  const serviceAccount = {
+    type: 'service_account',
+    project_id: process.env.FIREBASE_PROJECT_ID,
+    private_key: privateKey,
+    client_email: process.env.FIREBASE_CLIENT_EMAIL,
+  };
+
+  credential = admin.credential.cert(serviceAccount);
 }
 
-/**
- * Firestore database instance.
- *
- * This is the main object we use throughout the app to read/write data.
- * Firestore is a NoSQL document database — data is organized into
- * collections (like tables) and documents (like rows).
- *
- * Our collections:
- *   - creators      → creator profiles
- *   - transactions  → every tip that has been made
- *   - withdrawals   → every withdrawal request from a creator
- */
+// Prevent re-initialization on hot reloads (nodemon)
+if (!admin.apps.length) {
+  admin.initializeApp({ credential });
+}
+
 const db = admin.firestore();
 
 module.exports = { db, admin };
