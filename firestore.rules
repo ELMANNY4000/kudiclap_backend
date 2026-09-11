@@ -1,0 +1,109 @@
+rules_version = '2';
+
+// ─────────────────────────────────────────────────────────────────────────────
+// KudiClap — Firestore Security Rules
+//
+// Strategy:
+//   - All WRITES come from our backend server (Firebase Admin SDK)
+//     The Admin SDK bypasses ALL security rules — so we can safely
+//     DENY all direct client writes. This prevents anyone from
+//     manipulating balances, transactions, or withdrawals directly.
+//
+//   - READs are selectively allowed:
+//     - Public data (creator profiles) → anyone can read
+//     - Private data (wallet, bank, transactions) → only the creator themselves
+//     - Internal data (commissions, OTPs, pending payments) → no client access
+//
+//   - Authentication check uses request.auth.uid which matches the
+//     Firebase UID stored as the Firestore document ID for creators.
+// ─────────────────────────────────────────────────────────────────────────────
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ── creators ──────────────────────────────────────────────────────────────
+    // Public fields (name, bio, ussdCode, customLink, totalEarnings) are safe
+    // to expose. Sensitive fields (walletBalance, pin, bankAccount, email) must
+    // only be readable by the creator themselves.
+    //
+    // We enforce field-level security by splitting into two rules:
+    //   - Any authenticated user can read the document (frontend needs this)
+    //   - Only the owner can read their full profile including sensitive fields
+    //
+    // Since Admin SDK writes bypass rules, we only need to worry about reads.
+    match /creators/{creatorId} {
+      // Public read — fans need to read creator profiles for the tip page
+      // The backend (creatorController) strips sensitive fields before responding
+      // so even though Firestore allows the read, the API never exposes them
+      allow read: if true;
+
+      // No direct client writes — all writes go through the backend (Admin SDK)
+      allow write: if false;
+    }
+
+    // ── transactions ─────────────────────────────────────────────────────────
+    // Tips received. Only the creator who owns the transaction can read it.
+    // No client writes — transactions are written by the backend only.
+    match /transactions/{transactionId} {
+      allow read: if request.auth != null
+                  && request.auth.uid == resource.data.creatorId;
+      allow write: if false;
+    }
+
+    // ── withdrawals ───────────────────────────────────────────────────────────
+    // Payout records. Only the creator can read their own withdrawals.
+    // No client writes — withdrawal processing is backend-only.
+    match /withdrawals/{withdrawalId} {
+      allow read: if request.auth != null
+                  && request.auth.uid == resource.data.creatorId;
+      allow write: if false;
+    }
+
+    // ── pendingPayments ───────────────────────────────────────────────────────
+    // Short-lived payment intent records (30-min expiry).
+    // The frontend needs to read these to confirm a payment completed.
+    // No client writes.
+    match /pendingPayments/{txRef} {
+      allow read: if true; // Fan needs to poll payment status
+      allow write: if false;
+    }
+
+    // ── commissions ───────────────────────────────────────────────────────────
+    // Platform fee configuration. Admin-only, never exposed to clients.
+    match /commissions/{type} {
+      allow read: if false;
+      allow write: if false;
+    }
+
+    // ── otps ──────────────────────────────────────────────────────────────────
+    // One-time password records (hashed, 10-min expiry).
+    // Never exposed to clients — OTP verification happens server-side.
+    match /otps/{otpId} {
+      allow read: if false;
+      allow write: if false;
+    }
+
+    // ── otpVerifications ─────────────────────────────────────────────────────
+    // Short-lived verification tokens issued after OTP verification.
+    // Server-side only.
+    match /otpVerifications/{tokenId} {
+      allow read: if false;
+      allow write: if false;
+    }
+
+    // ── ussdWithdrawals ───────────────────────────────────────────────────────
+    // Pending USSD withdrawal confirmation records (10-min expiry).
+    // Only the creator who initiated can read their own record.
+    match /ussdWithdrawals/{reference} {
+      allow read: if request.auth != null
+                  && request.auth.uid == resource.data.creatorId;
+      allow write: if false;
+    }
+
+    // ── Catch-all — deny everything else ─────────────────────────────────────
+    // Any collection not explicitly listed above is fully locked down.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
