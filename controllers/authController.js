@@ -128,6 +128,9 @@ const signup = async (req, res, next) => {
       name,
       email,
       username: username.toLowerCase(),
+      // customLink is the fan-facing tip URL — e.g. kudiclap.com/ulodo
+      // Generated from username, stored so it can be shared/displayed easily
+      customLink: `kudiclap.com/${username.toLowerCase()}`,
       mobileMoneyNumber,
       ussdCode,
       bio: bio || '',
@@ -156,6 +159,7 @@ const signup = async (req, res, next) => {
       data: {
         uid,
         username: username.toLowerCase(),
+        customLink: `kudiclap.com/${username.toLowerCase()}`,
         ussdCode,
         customToken,
       },
@@ -246,13 +250,14 @@ const login = async (req, res, next) => {
           uid,
           name: creatorData.name,
           username: creatorData.username,
+          customLink: creatorData.customLink || `kudiclap.com/${creatorData.username}`,
           email: creatorData.email,
           ussdCode: creatorData.ussdCode,
           totalEarnings: creatorData.totalEarnings,
           walletBalance: creatorData.walletBalance,
           profilePicture: creatorData.profilePicture,
           bio: creatorData.bio,
-          hasPin: !!creatorData.pin, // Tell frontend whether PIN has been set (boolean only)
+          hasPin: !!creatorData.pin,
         },
       },
     });
@@ -319,6 +324,7 @@ const me = async (req, res, next) => {
         uid,
         name: creatorData.name,
         username: creatorData.username,
+        customLink: creatorData.customLink || `kudiclap.com/${creatorData.username}`,
         email: creatorData.email,
         ussdCode: creatorData.ussdCode,
         bio: creatorData.bio,
@@ -326,7 +332,6 @@ const me = async (req, res, next) => {
         totalEarnings: creatorData.totalEarnings,
         walletBalance: creatorData.walletBalance,
         hasPin: !!creatorData.pin,
-        // Bank account details for dashboard display
         bankAccountNumber: creatorData.bankAccountNumber || null,
         bankName: creatorData.bankName || null,
         bankAccountName: creatorData.bankAccountName || null,

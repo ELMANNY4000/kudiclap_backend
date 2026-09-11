@@ -61,6 +61,7 @@ const getCreatorByUsername = async (req, res, next) => {
         id: creatorData.id,
         name: creatorData.name,
         username: creatorData.username,
+        customLink: creatorData.customLink || `kudiclap.com/${creatorData.username}`,
         bio: creatorData.bio,
         profilePicture: creatorData.profilePicture,
         ussdCode: creatorData.ussdCode,
@@ -100,6 +101,7 @@ const getCreatorProfile = async (req, res, next) => {
         id: creatorData.id,
         name: creatorData.name,
         username: creatorData.username,
+        customLink: creatorData.customLink || `kudiclap.com/${creatorData.username}`,
         bio: creatorData.bio,
         profilePicture: creatorData.profilePicture,
         ussdCode: creatorData.ussdCode,
@@ -160,6 +162,7 @@ const getCreatorDashboard = async (req, res, next) => {
         id: creatorData.id,
         name: creatorData.name,
         username: creatorData.username,
+        customLink: creatorData.customLink || `kudiclap.com/${creatorData.username}`,
         email: creatorData.email,
         bio: creatorData.bio,
         profilePicture: creatorData.profilePicture,
@@ -167,8 +170,7 @@ const getCreatorDashboard = async (req, res, next) => {
         mobileMoneyNumber: creatorData.mobileMoneyNumber,
         totalEarnings: creatorData.totalEarnings,
         walletBalance: creatorData.walletBalance,
-        hasPin: !!creatorData.pin, // Never expose the hash itself
-        // Bank account (needed for withdrawal setup)
+        hasPin: !!creatorData.pin,
         bankAccountNumber: creatorData.bankAccountNumber || null,
         bankCode: creatorData.bankCode || null,
         bankName: creatorData.bankName || null,
