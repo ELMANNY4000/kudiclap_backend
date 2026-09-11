@@ -49,15 +49,25 @@ const { sendOtp: sendOtpEmail } = require('../services/emailService');
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Generates a cryptographically random 6-digit OTP code.
- * Padded with leading zeros if needed (e.g. "007341").
+ * Generates a cryptographically secure random 6-digit OTP code.
  *
- * @returns {string} A 6-digit string like "483921"
+ * Uses Node's built-in crypto.randomBytes() which reads from the OS
+ * cryptographically secure pseudorandom number generator (CSPRNG).
+ * This is significantly more secure than Math.random() which is NOT
+ * cryptographically random and could be predicted by an attacker.
+ *
+ * Process:
+ *   - randomBytes(3) gives 3 bytes = 24 bits of randomness = 0–16,777,215
+ *   - We take modulo 1,000,000 to get 0–999,999
+ *   - Pad with leading zeros to always return exactly 6 digits
+ *
+ * @returns {string} A 6-digit string like "048392"
  */
 const generateOtpCode = () => {
-  // Math.random gives a number between 0 and 1 — multiply to get 0–999999
-  const code = Math.floor(Math.random() * 1000000);
-  return code.toString().padStart(6, '0');
+  const crypto = require('crypto');
+  // 3 random bytes → integer 0–16,777,215 → modulo to 0–999,999 → pad to 6 digits
+  const randomInt = crypto.randomBytes(3).readUIntBE(0, 3) % 1_000_000;
+  return randomInt.toString().padStart(6, '0');
 };
 
 // ─────────────────────────────────────────────────────────────────────────────

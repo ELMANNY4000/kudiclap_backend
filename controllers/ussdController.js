@@ -11,18 +11,21 @@
  *
  *   2. Creator withdrawing via USSD (POST /api/ussd/withdraw/initiate)
  *      A creator initiates a withdrawal using their PIN via USSD simulation.
- *      This mirrors what would happen on a real USSD gateway — the creator
- *      dials a code, enters their PIN, and approves the withdrawal.
  *
- *      For the MVP: this is simulated via API calls (no real USSD gateway).
- *      The flow is:
+ *      Flow:
  *        a. POST /api/ussd/withdraw/initiate  → verify PIN → create pending withdrawal
- *        b. POST /api/ussd/withdraw/verify    → confirm with a verification code → execute withdrawal
+ *        b. POST /api/ussd/withdraw/verify    → verify confirmation code → execute Payaza transfer
  *        c. POST /api/ussd/withdraw/cancel    → cancel a pending USSD withdrawal
  *
- * ── Commission deduction on USSD withdrawals ─────────────────────────────────
- *   Commission rates are fetched from the commissions Firestore collection.
- *   If no commission is configured, the withdrawal proceeds fee-free.
+ * ── Security fixes applied ────────────────────────────────────────────────────
+ *
+ *   1. confirmationCode is now stored as a bcrypt hash in Firestore.
+ *      The raw code is returned to the frontend (dev mode) or sent via
+ *      USSD/SMS (production). The stored hash prevents leaking the code
+ *      if the Firestore database is ever compromised.
+ *
+ *   2. verifyUssdWithdrawal() now calls payaza.transfers.initiate() after
+ *      deducting the wallet — so real money actually moves to the creator's bank.
  *
  * Exported functions:
  *   - processUssdTip              → POST /api/ussd/tip
@@ -32,9 +35,13 @@
  */
 
 const bcrypt = require('bcrypt');
+const crypto = require('crypto');
 const { db } = require('../config/firebase');
+const { payaza } = require('../config/payaza');
+const { PayazaError } = require('payaza-node-sdk');
 const { validateUssdPayment, validateUssdWithdrawal, validateUssdVerify } = require('../utils/validation');
 const { calculateCommission } = require('../services/commissionService');
+const { sendWithdrawalUpdate } = require('../services/emailService');
 
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /api/ussd/tip
@@ -196,11 +203,20 @@ const initiateUssdWithdrawal = async (req, res, next) => {
       });
     }
 
-    // Generate a 6-digit confirmation code (simulates USSD callback to creator's phone)
-    const confirmationCode = Math.floor(100000 + Math.random() * 900000).toString();
+    // Generate a cryptographically secure 6-digit confirmation code
+    // Uses crypto.randomBytes() — NOT Math.random() which is not secure
+    const rawConfirmationCode = (crypto.randomBytes(3).readUIntBE(0, 3) % 1_000_000)
+      .toString()
+      .padStart(6, '0');
+
+    // Hash the confirmation code with bcrypt before storing in Firestore.
+    // This means if the ussdWithdrawals collection is ever compromised,
+    // the raw codes are not exposed — same pattern as OTP codes.
+    const hashedConfirmationCode = await bcrypt.hash(rawConfirmationCode, 10);
+
     const reference = `USSD-${Date.now()}-${uid.substring(0, 4)}`;
 
-    // Store the pending USSD withdrawal
+    // Store the pending USSD withdrawal with the HASHED confirmation code
     await db.collection('ussdWithdrawals').doc(reference).set({
       reference,
       creatorId: uid,
@@ -208,8 +224,7 @@ const initiateUssdWithdrawal = async (req, res, next) => {
       commission,
       totalDeduction,
       commissionBreakdown: breakdown,
-      confirmationCode, // In production this would NOT be stored in plain text
-                        // and would be sent securely to the creator's phone
+      confirmationCode: hashedConfirmationCode, // bcrypt hash — raw code never stored
       status: 'pending',
       createdAt: new Date(),
       expiresAt: new Date(Date.now() + 10 * 60 * 1000), // 10-minute expiry
@@ -223,8 +238,8 @@ const initiateUssdWithdrawal = async (req, res, next) => {
         amount,
         commission,
         totalDeduction,
-        // Return confirmation code in dev/test — in production this goes to phone via USSD
-        ...(process.env.NODE_ENV !== 'production' && { confirmationCode }),
+        // Return confirmation code in dev/test — in production this goes to phone via USSD/SMS
+        ...(process.env.NODE_ENV !== 'production' && { confirmationCode: rawConfirmationCode }),
         expiresInMinutes: 10,
       },
     });
@@ -293,20 +308,26 @@ const verifyUssdWithdrawal = async (req, res, next) => {
       });
     }
 
-    // Verify confirmation code
-    if (ussdData.confirmationCode !== confirmationCode.toString()) {
+    // Verify confirmation code using bcrypt.compare — the stored code is a hash
+    const codeValid = await bcrypt.compare(confirmationCode.toString(), ussdData.confirmationCode);
+    if (!codeValid) {
       return res.status(400).json({ success: false, error: 'Invalid confirmation code.' });
     }
 
     const creatorRef = db.collection('creators').doc(uid);
     const withdrawalRef = db.collection('withdrawals').doc();
 
+    // Build the Payaza transfer reference — unique, >= 10 chars
+    const payazaReference = `kc-wd-${withdrawalRef.id.substring(0, 10)}-${Date.now().toString().slice(-4)}`;
+
     // Atomically: deduct wallet + record withdrawal
     let newWalletBalance;
+    let creatorData;
     try {
       await db.runTransaction(async (firestoreTx) => {
         const freshDoc = await firestoreTx.get(creatorRef);
         const freshData = freshDoc.data();
+        creatorData = freshData;
 
         if (freshData.walletBalance < ussdData.totalDeduction) {
           throw Object.assign(
@@ -333,8 +354,8 @@ const verifyUssdWithdrawal = async (req, res, next) => {
           bankName: freshData.bankName || '',
           accountName: freshData.bankAccountName || freshData.name,
           status: 'pending',
-          source: 'ussd', // This withdrawal was initiated via USSD
-          payazaReference: `kc-wd-${withdrawalRef.id.substring(0, 10)}-${Date.now().toString().slice(-4)}`,
+          source: 'ussd',
+          payazaReference,
           payazaTransferId: null,
           timestamp: new Date(),
           updatedAt: new Date(),
@@ -349,6 +370,102 @@ const verifyUssdWithdrawal = async (req, res, next) => {
       }
       throw txError;
     }
+
+    // ── Call Payaza Transfer API ──────────────────────────────────────────────
+    // Now that the wallet has been deducted and the withdrawal record created,
+    // initiate the actual bank transfer via Payaza.
+    // If Payaza fails, we reverse the deduction immediately.
+    const reverseDeduction = async (reason) => {
+      try {
+        await db.runTransaction(async (firestoreTx) => {
+          const freshDoc = await firestoreTx.get(creatorRef);
+          firestoreTx.update(creatorRef, {
+            walletBalance: freshDoc.data().walletBalance + ussdData.totalDeduction,
+            updatedAt: new Date(),
+          });
+          firestoreTx.update(withdrawalRef, {
+            status: 'failed',
+            failureReason: reason,
+            updatedAt: new Date(),
+          });
+        });
+      } catch (reverseErr) {
+        console.error('[USSD Withdrawal] CRITICAL: failed to reverse deduction:', reverseErr.message);
+      }
+    };
+
+    // Fetch Payaza account reference for the transfer
+    let accountReference;
+    try {
+      const accountResponse = await payaza.account.view();
+      const accounts = Array.isArray(accountResponse.data) ? accountResponse.data : [accountResponse.data];
+      const ngnAccount = accounts.find(
+        (acc) => acc.currency === 'NGN' || acc.currency_code === 'NGN' || acc.accountCurrency === 'NGN'
+      );
+      accountReference = ngnAccount?.payazaAccountReference || ngnAccount?.account_reference;
+
+      if (!accountReference) throw new Error('No NGN Payaza account reference found.');
+    } catch (accError) {
+      await reverseDeduction(accError.message);
+      return res.status(502).json({
+        success: false,
+        error: 'Could not connect to payment gateway. Your balance has been restored. Please try again.',
+      });
+    }
+
+    // Initiate the Payaza bank transfer
+    try {
+      const transferResponse = await payaza.transfers.initiate({
+        transaction_type: 'nuban',
+        service_payload: {
+          payout_amount: ussdData.amount,
+          transaction_pin: parseInt(process.env.PAYAZA_TRANSACTION_PIN, 10),
+          account_reference: accountReference,
+          currency: 'NGN',
+          payout_beneficiaries: [
+            {
+              credit_amount: ussdData.amount,
+              account_number: creatorData.bankAccountNumber,
+              account_name: creatorData.bankAccountName || creatorData.name,
+              bank_code: creatorData.bankCode,
+              narration: 'KudiClap USSD payout',
+              transaction_reference: payazaReference,
+              sender: {
+                sender_name: 'KudiClap',
+                sender_phone_number: process.env.KUDICLAP_PHONE || '08000000000',
+                sender_address: 'Nigeria',
+              },
+            },
+          ],
+        },
+      });
+
+      const payazaTransferId = transferResponse?.data?.id || null;
+
+      // Update the withdrawal record with Payaza's transfer ID
+      await withdrawalRef.update({ payazaTransferId, updatedAt: new Date() });
+
+      console.log(`[USSD Withdrawal] Payaza transfer initiated: ref=${payazaReference}, id=${payazaTransferId}`);
+
+    } catch (payazaError) {
+      const errMsg = payazaError instanceof PayazaError ? payazaError.message : payazaError.message;
+      console.error('[USSD Withdrawal] Payaza transfer failed:', errMsg);
+      await reverseDeduction(errMsg);
+
+      return res.status(502).json({
+        success: false,
+        error: 'Withdrawal could not be processed. Your balance has been restored. Please try again.',
+      });
+    }
+
+    // ── Fire withdrawal email notification ─────────────────────────────────
+    sendWithdrawalUpdate({
+      to: creatorData.email,
+      creatorName: creatorData.name,
+      amount: ussdData.amount,
+      status: 'pending',
+      bankName: creatorData.bankName || 'your bank account',
+    }).catch((err) => console.error('[USSD Withdrawal] Email failed:', err.message));
 
     return res.status(200).json({
       success: true,
